@@ -59,7 +59,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: agent-sh/agnix@2c0e4efede3181599eca37619e8067ae2d941c00 # v0.57.0
+      - uses: agent-sh/agnix@cc559089a2e5fec8b84229c810827ff8d4685a22 # v0.59.0
         with:
           version: 'v0.57.0'
 
