@@ -16,6 +16,7 @@ export function fixture(): any {
       'valkey-review': 'valkeyRegistry1',
       'valkey-glide-review': 'glideRegistry1',
       'valkey-review-bot-review': 'reviewBotRegistry1',
+      'valkey-admin-review': 'adminRegistry1',
       curator: 'curatorRegistry1',
     },
     routes: [
