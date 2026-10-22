@@ -1,7 +1,8 @@
 # Valkey reviewer
 
 An automated code reviewer for pull requests to [Valkey](https://github.com/valkey-io/valkey),
-[Valkey GLIDE](https://github.com/valkey-io/valkey-glide) and this repository. It reads
+[Valkey GLIDE](https://github.com/valkey-io/valkey-glide),
+[Valkey Admin](https://github.com/valkey-io/valkey-admin) and this repository. It reads
 the change in a real checkout of the repository, checks its claims against the code (and,
 when it helps, by building and running tests), and posts a review with inline comments.
 
@@ -118,8 +119,8 @@ API Gateway -> receiver Lambda ---- verify signature, filter, budget, dedupe
 
 - `agents/common`: shared runtime for the reviewers: workspace preparation, the agent
   loop, tools, the review state comment, skill loading.
-- `agents/valkey-review`, `agents/valkey-glide-review`, `agents/valkey-review-bot-review`
-  (this repository): one reviewer per project, each
+- `agents/valkey-review`, `agents/valkey-glide-review`, `agents/valkey-admin-review`,
+  `agents/valkey-review-bot-review` (this repository): one reviewer per project, each
   with its container image, prompt (`config/prompt.md`) and project knowledge
   (`config/skill.md`).
 - `agents/curator`: turns maintainer feedback into concerns and graduated skills, and
@@ -138,7 +139,7 @@ See [docs/architecture.md](docs/architecture.md) for the request flow in detail,
 The reviewer runs on AWS: Amazon Bedrock models, Bedrock AgentCore runtimes, AWS Agent
 Registry, Lambda, SQS and DynamoDB. [infra/README.md](infra/README.md) lists the
 prerequisites (Node.js 24+, Docker that can build linux/arm64 images, the AWS CLI, a
-GitHub App, a Secrets Manager secret, four registries, model access), every configuration
+GitHub App, a Secrets Manager secret, five registries, model access), every configuration
 key, and the deploy
 commands. All deployment-specific values live in `infra/deploy.config.json`, which is not
 committed. Use an AWS account that runs nothing else: code from the pull requests under

@@ -92,12 +92,15 @@ test('the reviewer prompts share the mention and suppressed-skill text', () => {
   const valkey = read('../config/prompt.md');
   const glide = read('../../valkey-glide-review/config/prompt.md');
   const bot = read('../../valkey-review-bot-review/config/prompt.md');
+  const admin = read('../../valkey-admin-review/config/prompt.md');
   const section = (prompt) => prompt.slice(prompt.indexOf('## Mention-triggered reviews'), prompt.indexOf('\n## ', prompt.indexOf('## Mention-triggered reviews') + 1));
   // The only intended difference: what a request can single out.
   assert.ok(section(valkey).includes('a specific file,'));
   assert.equal(section(valkey).replace('a specific file,', 'a specific binding,'), section(glide));
   assert.equal(section(valkey).replace('a specific file,', 'a specific package,'), section(bot));
+  assert.equal(section(valkey).replace('a specific file,', 'a specific app,'), section(admin));
   const para = (prompt) => prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.equal(para(valkey), para(glide));
   assert.equal(para(valkey), para(bot));
+  assert.equal(para(valkey), para(admin));
 });

@@ -72,9 +72,11 @@ registry for it. Tell the other operators before the change merges.
 ## 3. The agent package
 
 Copy the closest reviewer. `agents/valkey-review` fits a C or C++ project,
-`agents/valkey-glide-review` a project with several language toolchains, and
+`agents/valkey-glide-review` a project with several language toolchains,
 `agents/valkey-review-bot-review` a TypeScript project of npm packages whose
-image installs their dependencies at build time. For
+image installs their dependencies at build time, and `agents/valkey-admin-review`
+a single npm workspace whose content is untrusted: its build tool starts each
+tool from `node_modules` without npm, so no package or lifecycle script runs. For
 valkey-search, copy `agents/valkey-review` to `agents/valkey-search-review`.
 
 - `package.json`: set `name` and `description`. `main` and the `start` script point at
@@ -184,8 +186,8 @@ Each of these lists the agents or reviewer ids by hand:
   reviewers and their repositories, and the `area_bucket` examples. They ship with the
   curator stack at deploy.
 - Docs that count or name the reviewers, images or registries: `README.md`,
-  `infra/README.md` (the Stacks table, the count of agent images in "builds the four
-  agent images", "Create four registries", "All four are required" and the
+  `infra/README.md` (the Stacks table, the count of agent images in "builds the five
+  agent images", "Create five registries", "All five are required" and the
   `skillsRegistries` table, the routes `reviewer` row, the
   `upstreamRepos` defaults table and the `agents` table) and
   [architecture.md](architecture.md).
