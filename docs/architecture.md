@@ -14,7 +14,7 @@ security model in [SECURITY.md](../SECURITY.md).
 | Invoker | `webhook/src/invoker.ts`, `webhook/src/watchdog.ts` | One Lambda per review route and one for the curator, each fed by its own SQS queue |
 | Token broker | `webhook/src/token-broker.ts`, checks in `webhook/src/broker.ts` | One Lambda per reviewer, invoked by that reviewer's runtime |
 | Skills-repo token broker | `webhook/src/skills-repo-broker.ts` | One Lambda, created when `skillsRepo` is set, invoked by the curator only |
-| Reviewers | `agents/common`, plus `agents/valkey-review`, `agents/valkey-glide-review` or `agents/valkey-review-bot-review` | One Bedrock AgentCore runtime and container image per reviewer |
+| Reviewers | `agents/common`, plus `agents/valkey-review`, `agents/valkey-glide-review`, `agents/valkey-review-bot-review` or `agents/valkey-admin-review` | One Bedrock AgentCore runtime and container image per reviewer |
 | Curator | `agents/curator`: feedback in `src/agent.ts`, skill maintenance in `src/maintenance.ts` | Its own AgentCore runtime |
 | Decay job and skill-maintenance scheduler | `ops/src/decay.ts`, `ops/src/releases.ts` | Lambda on a daily EventBridge schedule |
 | Infrastructure | `infra/lib/*.ts` | CDK app; the stacks are listed in [infra/README.md](../infra/README.md#stacks) |
@@ -468,8 +468,8 @@ loads graduated skills, assembles the tools and starts the loop.
 `prepareWorkspace` in `agents/common/src/workspace.ts`:
 
 - Works in the clone baked into the image (`/workspace/valkey`,
-  `/workspace/valkey-glide` or `/workspace/valkey-review-bot`, cloned with
-  `--filter=blob:limit=1m`). A warm
+  `/workspace/valkey-glide`, `/workspace/valkey-review-bot` or
+  `/workspace/valkey-admin`, cloned with `--filter=blob:limit=1m`). A warm
   container is reused across runs, so the clone may hold the previous run's
   state.
 - Reads the pull request. An automatic review (the envelope has a
@@ -586,8 +586,8 @@ model copied cannot start a heading there.
 
 There is no shell tool. `assembleCommonTools` (`agents/common/src/tools/index.ts`)
 builds the common set, and each reviewer adds its build tool when
-`ALLOW_BUILD` is true. The GLIDE and valkey-review-bot reviewers remove `lsp`,
-because their images have no language server.
+`ALLOW_BUILD` is true. The GLIDE, valkey-review-bot and valkey-admin reviewers
+remove `lsp`, because their images have no language server.
 
 | Tool | Code | What it is limited to |
 | --- | --- | --- |
@@ -600,6 +600,7 @@ because their images have no language server.
 | `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB (see below). |
 | `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB (see below). |
 | `build` (valkey-review-bot) | `agents/valkey-review-bot-review/src/tools/build.ts` | `npm run` of `build`, `typecheck` or `test` and `npm test`, with no npm options; `npx tsc --noEmit`; `npx cdk synth -c config=<file>` in `infra` only; `node --test` on test files (`checkBuildArgs` in `build-policy.ts`). npx runs with `--offline --no`, so it never installs a package. No install, publish, deploy or login. Working directory: a package directory inside the checkout. The image installs every package's dependencies from main at image build time. 8 minutes, 1 MB (see below). |
+| `build` (valkey-admin) | `agents/valkey-admin-review/src/tools/build.ts` | `tsc --noEmit -p <tsconfig>`, `vitest run`, `tsx --test` on unit test files under `src/`, `eslint` without `--fix`, `vite build`, and the fixed `tsup` build of `common`, each only in the package directories `checkBuildArgs` (`build-policy.ts`) lists for it, with allowlisted options and no path into a dot directory. Each tool's script starts from the root `node_modules` under the runtime's node, never through npm, so no package script and no lifecycle script runs; the tools still load the checkout's own config and test files. It refuses to run when the checkout tracks files under a `node_modules` or a package directory is a symbolic link. `common/dist` is rebuilt from the checkout before the first command that imports it. No install, publish, package, deploy, server or Electron. The image installs main's dependencies with `npm ci --ignore-scripts`. 8 minutes, 1 MB (see below). |
 
 Paths under `tools/` are in `agents/common/src/tools/`. The tool tables in
 each `config/prompt.md` describe the same set to the model.
@@ -625,8 +626,8 @@ Every reviewer prompt follows the same workflow headings:
 - The review state, then Completion criteria
 
 The GLIDE prompt adds a "Grep hazards" section and two worked examples, and
-the valkey-review-bot prompt a "Repository hazards" section and two worked
-examples.
+the valkey-review-bot and valkey-admin prompts a "Repository hazards" section
+and two worked examples each.
 
 ### Terminal tools
 
@@ -766,7 +767,10 @@ model-facing `git` tool runs with no credentials at all.
 `build` adds `OFFLINE_ENV` (`build-policy.ts`): the AWS config and
 credentials files point at `/dev/null`, instance metadata is off, and npm
 runs offline, so `cdk synth` and tests find no credentials and download
-nothing. `resolveInside` requires the
+nothing. The valkey-admin reviewer's `build` adds its own `OFFLINE_ENV`:
+the same AWS settings, `METADATA_SERVER_DETECTION=none` for
+google-auth-library, `CI=true`, and npm offline with scripts off in case
+code under test starts npm. `resolveInside` requires the
 working directory to resolve inside the checkout. Commands run from an
 argument list, never through a shell.
 
@@ -1374,7 +1378,7 @@ a registry check. The item records the checked file's commit in
 | --- | --- | --- | --- |
 | Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review) and pending markers `pending#owner/name#<pr>` (an hour after the queue delay) | Receiver; review workers extend and delete pending markers | Receiver, review workers (pending markers) |
 | `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, `message_id`, 24 hour TTL | Reviewer runtimes; review workers write each run's start record | Review workers |
-| `valkey_review_concerns`, `valkey_glide_review_concerns`, `valkey_review_bot_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims), `scripts/registry-skills.mjs adopt --apply` (records for orphaned skills) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` and `adopt` |
+| `valkey_review_concerns`, `valkey_glide_review_concerns`, `valkey_review_bot_review_concerns`, `valkey_admin_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims), `scripts/registry-skills.mjs adopt --apply` (records for orphaned skills) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` and `adopt` |
 | Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer, and `curator/prompt.md`, `curator/skill.md` and `curator/skill-check.md`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
 | Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records, retired ones `DEPRECATED` | Curator (`submit_skill`, check edits, retirement) | That reviewer, the curator |
 | Curator registry (AWS Agent Registry) | Skill-writing guidance | `scripts/publish-curator-skills.mjs` | Curator (`list_skill_authoring`) |
