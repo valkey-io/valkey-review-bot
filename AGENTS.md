@@ -6,7 +6,7 @@ Instructions for coding agents working in this repository. People and agents fol
 
 Before you write or change any reviewer knowledge, read [.agents/skills/writing-reviewer-skills/SKILL.md](.agents/skills/writing-reviewer-skills/SKILL.md) and follow it. That covers:
 
-- a built-in skill, `agents/<id>/config/skill.md`;
+- a reviewer's built-in skill, such as `agents/valkey-review/config/skill.md`;
 - the curator's skill reference, `agents/curator/skills/how-to-write-a-skill.md`;
 - rules about skills in a reviewer's prompt, such as `agents/valkey-review/config/prompt.md`.
 
