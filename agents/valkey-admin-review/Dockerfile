@@ -98,7 +98,10 @@ RUN git clone --filter=blob:limit=1m https://github.com/valkey-io/valkey-admin.g
 # starts Electron. node_modules/ is gitignored, so it survives the
 # `git clean -fd` and checkout of each run. A pull request is therefore
 # type-checked and tested against main's dependencies as of this build,
-# not against its own package-lock.json.
+# not against its own package-lock.json. node_modules belongs to the agent
+# user, so code under test can change it. That would carry over only into
+# a later review in the same container, and the invoker starts a new
+# session, so a new container, for every run (docs/architecture.md).
 RUN cd /workspace/valkey-admin \
  && ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci --ignore-scripts --no-audit --no-fund \
  && npm cache clean --force

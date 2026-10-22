@@ -113,6 +113,9 @@ test('tsx runs node --test on unit tests in apps/server and common, never integr
   refused('tsx', ['--test', 'src/__integration__/connection.integration.test.ts'], 'apps/server', /integration test/);
   refused('tsx', ['--test', 'src/__integration__/**/*.integration.test.ts'], 'apps/server', /integration test/);
   refused('tsx', ['--test', 'src/**/*.integration.test.ts'], 'apps/server', /integration test/);
+  // node expands the glob itself, and src/** would reach src/__integration__/.
+  refused('tsx', ['--test', 'src/**/*.test.ts'], 'apps/server', /under src\/__tests__\//);
+  refused('tsx', ['--test', 'src/*/*.test.ts'], 'apps/server', /under src\/__tests__\//);
   for (const file of ['src/index.ts', 'src/session.ts', 'test/x.test.ts', '/tmp/x.test.ts', 'src/../../x.test.ts', 'src/__tests__']) {
     refused('tsx', ['--test', file], 'apps/server');
   }
@@ -146,6 +149,7 @@ test('vite builds and tsup builds common, each with one fixed argv', () => {
   refused('tsup', [...COMMON_BUILD_ARGS, '--watch'], 'common', /tsup runs only/);
   assert.deepEqual(finalArgs('tsup', COMMON_BUILD_ARGS), [...COMMON_BUILD_ARGS, '--no-config']);
   assert.deepEqual(finalArgs('vitest', ['run']), ['run']);
+  assert.deepEqual(finalArgs('tsc', ['--noEmit', '-p', 'tsconfig.json']), ['--noEmit', '-p', 'tsconfig.json', '--incremental', 'false']);
 });
 
 test('common/dist is built first only for the commands that import it', () => {
