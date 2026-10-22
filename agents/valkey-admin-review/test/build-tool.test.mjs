@@ -1,6 +1,7 @@
 import '../../common/test/support/ts-resolve.mjs';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -47,7 +48,13 @@ function workspace() {
     writeFileSync(path.join(root, dir, 'package.json'), JSON.stringify({ name: path.basename(dir), scripts }));
   }
   for (const bin of ['tsc', 'vitest', 'tsx', 'eslint', 'vite', 'tsup']) installStub(root, path.join(root, 'node_modules'), bin);
+  git(root, 'init', '-q');
   return root;
+}
+
+// git as the tool runs it: no global or system configuration.
+function git(root, ...args) {
+  execFileSync('git', args, { cwd: root, env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
 }
 
 const calls = (root) => existsSync(path.join(root, 'calls.log'))
@@ -56,7 +63,21 @@ const calls = (root) => existsSync(path.join(root, 'calls.log'))
 const hooks = (root) => ['prestart', 'start', 'poststart', 'pretest', 'test', 'posttest', 'prepare', 'preinstall', 'postinstall', 'prebuild', 'build', 'postbuild', 'prelint', 'lint', 'prebuild-dir']
   .filter((name) => existsSync(path.join(root, `HOOK-${name}`)));
 
-test('every tool runs from node_modules, and no package or lifecycle script runs', async () => {
+// npm, npx, pnpm and yarn on PATH record any call. The tool must start
+// none of them, so neither a package script nor a lifecycle hook can run.
+function withPackageManagerSpies(root, fn) {
+  const spies = path.join(root, 'spy-bin');
+  mkdirSync(spies);
+  for (const name of ['npm', 'npx', 'pnpm', 'yarn', 'corepack']) {
+    writeFileSync(path.join(spies, name), `#!/bin/sh\necho "$0 $*" >> ${JSON.stringify(path.join(root, 'package-manager-calls.log'))}\n`);
+    chmodSync(path.join(spies, name), 0o755);
+  }
+  const saved = process.env.PATH;
+  process.env.PATH = `${spies}${path.delimiter}${saved}`;
+  return fn().finally(() => { process.env.PATH = saved; });
+}
+
+test('every tool runs from node_modules, and no package manager, package script or lifecycle script runs', async () => {
   const root = workspace();
   const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
   const runs = [
@@ -67,13 +88,17 @@ test('every tool runs from node_modules, and no package or lifecycle script runs
     { subcommand: 'vite', args: ['build'], dir: 'apps/frontend' },
     { subcommand: 'tsup', args: [...COMMON_BUILD_ARGS], dir: 'common' },
   ];
-  for (const input of runs) {
-    const out = await tool.invoke(input);
-    assert.match(out, new RegExp(`^ran ${input.subcommand} `), out);
-    assert.match(out, /\n\[exit 0\]$/);
-  }
+  await withPackageManagerSpies(root, async () => {
+    for (const input of runs) {
+      const out = await tool.invoke(input);
+      assert.match(out, new RegExp(`^ran ${input.subcommand} `), out);
+      assert.match(out, /\n\[exit 0\]$/);
+    }
+  });
   assert.deepEqual(calls(root).map((c) => [c.bin, path.relative(root, c.cwd) || '.']), runs.map((r) => [r.subcommand, r.dir]));
+  assert.deepEqual(calls(root)[0].args, ['--noEmit', '-p', 'tsconfig.json', '--incremental', 'false']);
   assert.deepEqual(calls(root).at(-1).args, [...COMMON_BUILD_ARGS, '--no-config']);
+  assert.equal(existsSync(path.join(root, 'package-manager-calls.log')), false, 'a package manager was started');
   assert.deepEqual(hooks(root), []);
 });
 
@@ -97,29 +122,67 @@ test('refused calls run nothing: npm start, .prebuild and dot paths', async () =
   assert.deepEqual(hooks(root), []);
 });
 
-test('a .bin link that leaves node_modules is not followed', async () => {
+test('a .bin link that leaves the root node_modules is not followed', async () => {
   const root = workspace();
-  const binDir = path.join(root, 'apps', 'server', 'node_modules', '.bin');
-  mkdirSync(binDir, { recursive: true });
-  symlinkSync(path.join('..', '..', '..', '..', '.prebuild', 'index.js'), path.join(binDir, 'tsx'));
-  // The root's tsx is used instead of the package's escaping link.
-  assert.equal(resolveBin(root, 'apps/server', 'tsx'), realpathSync(path.join(root, 'node_modules', 'tsx', 'cli.mjs')));
-  const out = await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'tsx', args: ['--test', 'src/__tests__/a.test.ts'], dir: 'apps/server' });
-  assert.match(out, /^ran tsx --test/);
-  assert.deepEqual(hooks(root), []);
-  // With no installed copy at all, the tool says so and runs nothing.
-  const bare = mkdtempSync(path.join(tmpdir(), 'valkey-admin-bare-'));
-  mkdirSync(path.join(bare, 'apps', 'server'), { recursive: true });
-  assert.match(await buildValkeyAdminBuildTool({ workspaceRoot: bare }).invoke({ subcommand: 'tsx', args: ['--test', 'src/__tests__/a.test.ts'], dir: 'apps/server' }),
+  const link = path.join(root, 'node_modules', '.bin', 'tsx');
+  renameSync(link, `${link}.orig`);
+  symlinkSync(path.join('..', '..', '.prebuild', 'index.js'), link);
+  assert.equal(resolveBin(root, 'tsx'), null);
+  assert.match(await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'tsx', args: ['--test', 'src/__tests__/a.test.ts'], dir: 'apps/server' }),
     /^ERROR: tsx is not installed in node_modules/);
+  assert.deepEqual(hooks(root), []);
+  assert.deepEqual(calls(root), []);
 });
 
-test("a package's own node_modules comes before the root's", async () => {
+test("a package's own node_modules is never used", async () => {
   const root = workspace();
-  installStub(root, path.join(root, 'apps', 'frontend', 'node_modules'), 'vitest');
-  const out = await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/frontend' });
-  assert.match(out, /^ran vitest run/);
-  assert.ok(resolveBin(root, 'apps/frontend', 'vitest').includes(path.join('apps', 'frontend', 'node_modules', 'vitest')));
+  // valkey-admin installs nothing there, so whatever is there came from the checkout.
+  writeFileSync(path.join(root, 'apps', 'frontend', 'evil.mjs'), STUB('evil', root));
+  mkdirSync(path.join(root, 'apps', 'frontend', 'node_modules', '.bin'), { recursive: true });
+  symlinkSync(path.join('..', '..', 'evil.mjs'), path.join(root, 'apps', 'frontend', 'node_modules', '.bin', 'vitest'));
+  assert.equal(resolveBin(root, 'vitest'), realpathSync(path.join(root, 'node_modules', 'vitest', 'cli.mjs')));
+  assert.match(await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/frontend' }), /^ran vitest run/);
+  assert.deepEqual(calls(root).map((c) => c.bin), ['vitest']);
+});
+
+test('a root node_modules that is a symbolic link is not used', async () => {
+  const root = workspace();
+  renameSync(path.join(root, 'node_modules'), path.join(root, '.prebuild', 'node_modules'));
+  symlinkSync(path.join('.prebuild', 'node_modules'), path.join(root, 'node_modules'));
+  assert.equal(resolveBin(root, 'eslint'), null);
+  assert.match(await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'eslint', args: ['.'], dir: '.' }), /^ERROR: /);
+  assert.deepEqual(calls(root), []);
+});
+
+test('a checkout that tracks files under a node_modules gets no build at all', async () => {
+  for (const tracked of ['node_modules/typescript/bin/tsc', 'common/node_modules/.bin/tsc', 'apps/server/node_modules']) {
+    const root = workspace();
+    const file = path.join(root, tracked);
+    mkdirSync(path.dirname(file), { recursive: true });
+    if (!existsSync(file)) writeFileSync(file, 'tracked\n');
+    git(root, 'add', '-f', '--', tracked);
+    const out = await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'tsc', args: ['--noEmit', '-p', 'tsconfig.json'], dir: 'common' });
+    assert.match(out, /^ERROR: the pull request tracks files under node_modules \(/, tracked);
+    assert.ok(out.includes(JSON.stringify(tracked)), out);
+    assert.deepEqual(calls(root), [], tracked);
+  }
+});
+
+test('a package directory that is a symbolic link gets no build', async () => {
+  const root = workspace();
+  renameSync(path.join(root, 'apps', 'server'), path.join(root, '.prebuild', 'server'));
+  symlinkSync(path.join('..', '.prebuild', 'server'), path.join(root, 'apps', 'server'));
+  const out = await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'tsx', args: ['--test', 'src/__tests__/a.test.ts'], dir: 'apps/server' });
+  assert.match(out, /^ERROR: dir "apps\/server" is a symbolic link at this head \(it resolves to "\.prebuild\/server"\)/);
+  assert.deepEqual(calls(root), []);
+});
+
+test('with no installed copy of a tool, the tool says so and runs nothing', async () => {
+  const bare = realpathSync(mkdtempSync(path.join(tmpdir(), 'valkey-admin-bare-')));
+  mkdirSync(path.join(bare, 'apps', 'server'), { recursive: true });
+  git(bare, 'init', '-q');
+  assert.match(await buildValkeyAdminBuildTool({ workspaceRoot: bare }).invoke({ subcommand: 'tsx', args: ['--test', 'src/__tests__/a.test.ts'], dir: 'apps/server' }),
+    /^ERROR: tsx is not installed in node_modules/);
 });
 
 test('common/dist is built once per review, before the first command that imports it', async () => {
@@ -146,6 +209,28 @@ test('when common does not build, the command that needs it does not run', async
   assert.match(out, /^common\/dist could not be built from the checkout, so vitest in apps\/metrics did not run\./);
   assert.match(out, /tsup failed/);
   assert.deepEqual(calls(root).map((c) => c.bin), ['tsup']);
+});
+
+test('parallel calls run one at a time, so common/dist is built once and before its readers', async () => {
+  const root = workspace();
+  const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
+  const outs = await Promise.all([
+    tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' }),
+    tool.invoke({ subcommand: 'vite', args: ['build'], dir: 'apps/server' }),
+    tool.invoke({ subcommand: 'tsc', args: ['--noEmit', '-p', 'tsconfig.json'], dir: 'apps/server' }),
+  ]);
+  for (const out of outs) assert.match(out, /\[exit 0\]$/);
+  assert.deepEqual(calls(root).map((c) => `${c.bin} ${path.relative(root, c.cwd)}`), ['tsup common', 'vitest apps/metrics', 'vite apps/server', 'tsc apps/server']);
+});
+
+test('a failed explicit tsup makes the next reader build common/dist again', async () => {
+  const root = workspace();
+  const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
+  await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' });
+  writeFileSync(path.join(root, 'fail-tsup'), '');
+  assert.match(await tool.invoke({ subcommand: 'tsup', args: [...COMMON_BUILD_ARGS], dir: 'common' }), /\[exit 1\]$/);
+  assert.match(await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' }), /^common\/dist could not be built/);
+  assert.deepEqual(calls(root).map((c) => c.bin), ['tsup', 'vitest', 'tsup', 'tsup']);
 });
 
 // Code from the pull request runs here. It sees no credential, and the

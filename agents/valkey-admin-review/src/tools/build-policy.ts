@@ -13,10 +13,13 @@
  * Nothing installs, publishes, packages, deploys, starts a server or starts
  * Electron, and no option outside a short allowlist reaches a tool.
  *
- * The checkout is untrusted. One attack this shuts out: a pull request
- * that hides code in a `.prebuild` directory and runs it from a
- * `prestart` hook when someone runs `npm start`. No path the tool accepts
- * may name a dot directory.
+ * The checkout is untrusted. This keeps out code that only a package
+ * script would start, such as a `.prebuild` directory run from a
+ * `prestart` hook by `npm start`, and no path the tool accepts may name a
+ * dot directory. The tools still load the checkout's own configuration,
+ * setup and test files (vite.config.ts, vitest.config.ts, eslint.config.mjs,
+ * the tests), as running any project's tests does; SECURITY.md describes
+ * what that code can reach.
  */
 
 export const SUBCOMMAND_NAMES = ['tsc', 'vitest', 'tsx', 'eslint', 'vite', 'tsup'] as const;
@@ -90,8 +93,11 @@ const TSCONFIG = /^tsconfig[\w.-]*\.json$/;
  */
 const RELATIVE_PATH = /^(?![/-])(?!(.*\/)?\.)[\w./@*-]+$/;
 
-/** A file node --test runs under tsx: a unit test under src/, not an integration test. */
-const TSX_TEST_FILE = /^src\/[\w./@*-]*\.test\.(ts|mts|tsx|js|mjs)$/;
+/**
+ * A file node --test runs under tsx: a unit test under src/__tests__/. A
+ * glob such as src/**\/*.test.ts would also reach src/__integration__/.
+ */
+const TSX_TEST_FILE = /^src\/__tests__\/[\w./@*-]*\.test\.(ts|mts|tsx|js|mjs)$/;
 
 /** The node --test options tsx passes through. */
 const NODE_TEST_OPTIONS = /^--(test-name-pattern|test-skip-pattern)=.+$/;
@@ -169,7 +175,7 @@ function checkTsx(args: readonly string[]): string | null {
     const refused = checkPath(a, 'tsx test file');
     if (refused) return refused;
     if (!TSX_TEST_FILE.test(a)) {
-      return `tsx --test takes unit test files under src/, such as src/__tests__/session.test.ts or the glob src/__tests__/*.test.ts. Got "${a}".`;
+      return `tsx --test takes unit test files under src/__tests__/, such as src/__tests__/session.test.ts or the glob src/__tests__/*.test.ts. Got "${a}".`;
     }
     files++;
   }
@@ -227,9 +233,15 @@ export function checkBuildArgs(subcommand: Subcommand, args: readonly string[], 
   }
 }
 
-/** The argv to run for an accepted call: tsup never loads a config file. */
+/**
+ * The argv to run for an accepted call. tsup loads no tsup config file, and
+ * tsc writes no .tsbuildinfo even when the checkout's tsconfig turns on
+ * incremental builds with a tsBuildInfoFile of its choosing.
+ */
 export function finalArgs(subcommand: Subcommand, args: readonly string[]): string[] {
-  return subcommand === 'tsup' ? [...args, '--no-config'] : [...args];
+  if (subcommand === 'tsup') return [...args, '--no-config'];
+  if (subcommand === 'tsc') return [...args, '--incremental', 'false'];
+  return [...args];
 }
 
 /**
@@ -255,12 +267,12 @@ export function describeBuildTool(): string {
 
 - \`tsc\` (in ${dirs('tsc')}): \`--noEmit\` with \`-p <tsconfig>\`, and ${TSC_OPTIONS.filter((o) => !['--noEmit', '-p', '--project'].includes(o)).join(', ')}.
 - \`vitest\` (in ${dirs('vitest')}): \`run\`, then test file filters, \`-t <pattern>\` or \`--testNamePattern=<pattern>\`, and \`--reporter=<${VITEST_REPORTERS.join('|')}>\`.
-- \`tsx\` (in ${dirs('tsx')}): \`--test\` with unit test files or globs under \`src/\`, and \`--test-name-pattern=<pattern>\` or \`--test-skip-pattern=<pattern>\`. No integration tests.
+- \`tsx\` (in ${dirs('tsx')}): \`--test\` with unit test files or globs under \`src/__tests__/\`, and \`--test-name-pattern=<pattern>\` or \`--test-skip-pattern=<pattern>\`. No integration tests.
 - \`eslint\` (in ${dirs('eslint')}): paths, and ${ESLINT_OPTIONS.join(', ')}. No --fix.
 - \`vite\` (in ${dirs('vite')}): \`build\` only.
 - \`tsup\` (in ${dirs('tsup')}): only ${COMMON_BUILD_ARGS.join(' ')}, which builds \`common/dist\`.
 
-The first \`vitest\` run in \`apps/metrics\`, \`tsc\` in \`apps/server\` or \`vite build\` in \`apps/server\` or \`apps/metrics\` of a review builds \`common/dist\` from the checkout first. Tools start from the installed node_modules, never through npm, so no package script or lifecycle script runs. No path may start with \`/\`, \`-\` or contain \`..\` or a dot directory. Every command gets an environment without credentials, with the AWS config files, instance metadata and the GCE metadata server turned off. The packages installed are those of main when the image was built. Nothing installs, publishes, packages, deploys, or starts a server or Electron.
+The first \`vitest\` run in \`apps/metrics\`, \`tsc\` in \`apps/server\` or \`vite build\` in \`apps/server\` or \`apps/metrics\` of a review builds \`common/dist\` from the checkout first. Tools start from the installed node_modules, never through npm, so no package script or lifecycle script runs; they still load the checkout's own config, setup and test files. No path may start with \`/\`, \`-\` or contain \`..\` or a dot directory. Every command gets an environment without credentials, with the AWS config files, instance metadata and the GCE metadata server turned off. The packages installed are those of main when the image was built. Nothing installs, publishes, packages, deploys, or starts a server or Electron.
 
 Output is capped at 1 MB and 8 minutes. Use it when a claim hinges on a type-check, test, lint or build result, not to "just check".`;
 }
