@@ -46,10 +46,12 @@ describe('defaults', () => {
       'valkey-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
       'valkey-glide-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
       'valkey-review-bot-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
+      'valkey-admin-review': { maxIterations: 150, maxTokens: 32768, allowBuild: true, allowWrite: true },
       curator: { maxIterations: 40, maxTokens: 16384, graduationThreshold: 4 },
     });
     expect(config.upstreamRepos).toEqual({
       'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot',
+      'valkey-admin-review': 'valkey-io/valkey-admin',
     });
     expect(config.decay).toEqual({ halfLifeDays: 30, floor: 0.05, graduatedHalfLifeDays: 180 });
     // Report mode: nothing edits, retires or opens a pull request until the operator turns it on.
@@ -108,6 +110,7 @@ describe('defaults', () => {
     expect(tokenBrokerRepos(config, 'valkey-glide-review')).toEqual(['example-org/valkey-glide']);
     // No route in the fixture: the broker issues no token at all.
     expect(tokenBrokerRepos(config, 'valkey-review-bot-review')).toEqual([]);
+    expect(tokenBrokerRepos(config, 'valkey-admin-review')).toEqual([]);
   });
 
   test('a repository named . or .. is refused, as the decay job and the curator refuse it', () => {
@@ -127,6 +130,7 @@ describe('defaults', () => {
     expect(config.upstreamRepos['valkey-review']).toBe('');
     expect(config.upstreamRepos['valkey-glide-review']).toBe('valkey-io/valkey-glide');
     expect(config.upstreamRepos['valkey-review-bot-review']).toBe('valkey-io/valkey-review-bot');
+    expect(config.upstreamRepos['valkey-admin-review']).toBe('valkey-io/valkey-admin');
   });
 });
 
@@ -239,7 +243,7 @@ describe('routes', () => {
       raw.routes[1].reviewer = 'valkey-other-review';
     }));
     expect(message).toContain('routes[0].repo must be owner/name');
-    expect(message).toContain('routes[1].reviewer must be one of valkey-review, valkey-glide-review, valkey-review-bot-review (got "valkey-other-review")');
+    expect(message).toContain('routes[1].reviewer must be one of valkey-review, valkey-glide-review, valkey-review-bot-review, valkey-admin-review (got "valkey-other-review")');
   });
 
   test('flags are booleans and the allowlist holds logins', () => {
@@ -381,10 +385,12 @@ describe('numbers', () => {
     ['valkey-review.maxIterations', 1, 500],
     ['valkey-glide-review.maxIterations', 1, 500],
     ['valkey-review-bot-review.maxIterations', 1, 500],
+    ['valkey-admin-review.maxIterations', 1, 500],
     ['curator.maxIterations', 1, 500],
     ['valkey-review.maxTokens', 1024, 200_000],
     ['valkey-glide-review.maxTokens', 1024, 200_000],
     ['valkey-review-bot-review.maxTokens', 1024, 200_000],
+    ['valkey-admin-review.maxTokens', 1024, 200_000],
     ['curator.maxTokens', 1024, 200_000],
     ['curator.graduationThreshold', 2, 100],
   ];

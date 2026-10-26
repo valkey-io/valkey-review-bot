@@ -50,6 +50,7 @@ When that section is present:
   agents/common/              Shared reviewer runtime: workspace preparation, agent loop, tools, review state, skill loading, skill-check code.
   agents/valkey-review/       Reviewer for valkey-io/valkey: Dockerfile, make tool, config/prompt.md, config/skill.md.
   agents/valkey-glide-review/ Reviewer for valkey-io/valkey-glide: Dockerfile, build tool, prompt, skill.
+  agents/valkey-admin-review/ Reviewer for valkey-io/valkey-admin: Dockerfile, build tool, prompt, skill.
   agents/valkey-review-bot-review/  This reviewer: Dockerfile, build tool, prompt, skill.
   agents/curator/             Turns maintainer feedback into concerns and skills; skill checks, retirements, repo skill pull requests.
   webhook/                    Lambdas: receiver, per-route invoker (its redelivery watchdog is src/watchdog.ts), token brokers, skills-repo broker.
