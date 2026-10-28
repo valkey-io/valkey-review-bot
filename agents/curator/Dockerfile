@@ -5,7 +5,7 @@
 # upstream into a fresh directory under /tmp/skill-check and deletes it
 # afterwards. The base image is pinned by digest.
 
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS build
+FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe AS build
 
 ENV NODE_ENV=development
 
@@ -33,7 +33,7 @@ RUN npx tsc --noEmit && npx tsc -p tsconfig.json
 # uses openai 7. npm ci installs the lockfile as it is.
 RUN npm ci --omit=dev --no-audit --no-fund
 
-FROM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:86f07bc9c5dce4578cf37e5a418b7bfc7f817cda25cde66e2b66e95ed86c4567 AS runtime
+FROM public.ecr.aws/docker/library/node:26-bookworm-slim@sha256:28147155d47dc31abe0a46e0d12b59b2fb3d0a2dcc5dc65fce76a074180b16fe AS runtime
 
 ENV NODE_ENV=production
 
