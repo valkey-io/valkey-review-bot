@@ -30,6 +30,14 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *      Everything else, and a thread reply even when it also starts a
  *      re-review, is checked as maintainer feedback and sent to the
  *      curator queue.
+ *   4. After that routing, a ready-label reconcile is invoked (never a
+ *      500) on pull_request synchronize/closed/converted_to_draft/
+ *      ready_for_review/reopened, pull_request_review_thread
+ *      resolved/unresolved, pull_request_review_comment created/deleted,
+ *      and issue_comment created/deleted on a pull request. It still
+ *      runs when review routing returns 500: GitHub does not retry a
+ *      failed delivery, and a push that failed to queue must still drop
+ *      the ready label. The thread event is not curator feedback.
  *
  * Status codes: 401 for a bad signature, 400 for a payload this code
  * cannot use, 500 when the work could not be queued. GitHub does not
@@ -62,6 +70,15 @@ export interface DeliveryDeps {
   /** A GitHub client authenticated as the installation. */
   readonly github: (installationId: number) => Promise<GitHubApi>;
   readonly approveInstruction: (instruction: string) => Promise<Verdict>;
+  /**
+   * Reconcile the ready-for-human-review label. Fire-and-forget: a
+   * failure is logged and never fails the delivery.
+   */
+  readonly syncReadyLabel?: (args: {
+    readonly installationId: number;
+    readonly repo: string;
+    readonly prNumber: number;
+  }) => Promise<void>;
   readonly log?: (line: string) => void;
 }
 
@@ -76,6 +93,17 @@ interface Target {
 }
 
 const FEEDBACK_EVENTS: ReadonlySet<string> = new Set(['issue_comment', 'pull_request_review_comment', 'pull_request_review']);
+const THREAD_EVENT = 'pull_request_review_thread';
+/** pull_request / thread / review-comment actions that can change the ready label. */
+const READY_LABEL_PULL_ACTIONS: ReadonlySet<string> = new Set([
+  'synchronize', 'closed', 'converted_to_draft', 'ready_for_review', 'reopened',
+]);
+/** These can only remove the label. Invoke them before routing so a routing timeout cannot skip that. */
+const READY_LABEL_REMOVAL_ACTIONS: ReadonlySet<string> = new Set([
+  'synchronize', 'closed', 'converted_to_draft',
+]);
+const READY_LABEL_THREAD_ACTIONS: ReadonlySet<string> = new Set(['resolved', 'unresolved']);
+const READY_LABEL_COMMENT_ACTIONS: ReadonlySet<string> = new Set(['created', 'deleted', 'edited']);
 /** The pull_request actions that start an automatic review, and the trigger each sends. */
 const REVIEW_TRIGGERS: ReadonlyMap<string, AutomaticTrigger> = new Map([
   ['opened', 'opened'],
@@ -491,31 +519,80 @@ export function createDeliveryHandler(
     });
   }
 
+  /**
+   * Never raises into the delivery: a failed invoke is logged and the
+   * delivery's status stands. Removal actions run before routing, so a
+   * routing timeout still drops a stale label. Everything else runs
+   * after routing, including when routing returned 500.
+   */
+  async function maybeSyncReadyLabel(eventType: string, payload: WebhookPayload, target: Target): Promise<void> {
+    if (!deps.syncReadyLabel) return;
+    const action = payload.action ?? '';
+    const sync = (eventType === 'pull_request' && READY_LABEL_PULL_ACTIONS.has(action))
+      || (eventType === THREAD_EVENT && READY_LABEL_THREAD_ACTIONS.has(action))
+      || (eventType === 'pull_request_review_comment' && READY_LABEL_COMMENT_ACTIONS.has(action))
+      || (eventType === 'issue_comment' && READY_LABEL_COMMENT_ACTIONS.has(action) && payload.issue?.pull_request);
+    if (!sync) return;
+    const prNumber = payload.pull_request?.number ?? payload.issue?.number;
+    if (typeof prNumber !== 'number') return;
+    const route = config.reviewRoutes.get(target.repo.toLowerCase());
+    if (!route?.readyLabel) return;
+    try {
+      await deps.syncReadyLabel({ installationId: target.installationId, repo: target.repo, prNumber });
+    } catch (err) {
+      console.error(`[ready-label] invoke failed repo=${target.repo} pr=${prNumber}`, err);
+    }
+  }
+
   async function dispatch(eventType: string, payload: WebhookPayload): Promise<Outcome> {
     if (eventType === 'ping') return { status: 200, body: { ok: true, ping: true } };
-    if (eventType !== 'pull_request' && !FEEDBACK_EVENTS.has(eventType)) return skip(`event=${token(eventType)}`);
+    if (eventType !== 'pull_request' && eventType !== THREAD_EVENT && !FEEDBACK_EVENTS.has(eventType)) {
+      return skip(`event=${token(eventType)}`);
+    }
 
     const repo = payload.repository?.full_name;
     if (!repo) return fail(400, 'missing-repository');
     const installationId = payload.installation?.id ?? config.installationId;
     if (typeof installationId !== 'number') return fail(400, 'missing-installation');
     const target = { repo, installationId };
+    const removalFirst = eventType === 'pull_request' && READY_LABEL_REMOVAL_ACTIONS.has(payload.action ?? '');
+    if (removalFirst) await maybeSyncReadyLabel(eventType, payload, target);
 
-    if (eventType === 'pull_request') return pullRequest(payload, target);
-
-    // A summons is a command, not feedback: it ends here. A thread reply
-    // may start a re-review and then still goes to the curator.
-    const m = detectMention(eventType, payload, { botLogin: config.botLogin, isBotAuthor });
-    if (m) {
-      const route = config.reviewRoutes.get(repo.toLowerCase());
-      if (m.kind === 'summon') return route ? mention(m, route, target) : skip(`mention:unrouted-repo=${repo}`);
-      if (route?.threadReplyReview) {
-        const outcome = await mention(m, route, target);
-        if (outcome.status >= 500) return outcome;
-        log(`[mention] repo=${repo} pr=${m.prNumber} decision=${decisionOf(outcome)}`);
+    let outcome: Outcome;
+    try {
+      if (eventType === 'pull_request') {
+        outcome = await pullRequest(payload, target);
+      } else if (eventType === THREAD_EVENT) {
+        // Thread resolve/unresolve never starts a review and is not curator
+        // feedback; it only recomputes the ready label.
+        outcome = skip(`action=${payload.action ?? ''}`);
+      } else {
+        // A summons is a command, not feedback: it ends here. A thread reply
+        // may start a re-review and then still goes to the curator.
+        const m = detectMention(eventType, payload, { botLogin: config.botLogin, isBotAuthor });
+        if (m) {
+          const route = config.reviewRoutes.get(repo.toLowerCase());
+          if (m.kind === 'summon') {
+            outcome = route ? await mention(m, route, target) : skip(`mention:unrouted-repo=${repo}`);
+          } else if (route?.threadReplyReview) {
+            outcome = await mention(m, route, target);
+            if (outcome.status < 500) {
+              log(`[mention] repo=${repo} pr=${m.prNumber} decision=${decisionOf(outcome)}`);
+              outcome = await feedback(eventType, payload, target);
+            }
+          } else {
+            outcome = await feedback(eventType, payload, target);
+          }
+        } else {
+          outcome = await feedback(eventType, payload, target);
+        }
       }
+    } catch (err) {
+      console.error('[receiver] delivery failed', err);
+      outcome = fail(500, 'internal');
     }
-    return feedback(eventType, payload, target);
+    if (!removalFirst) await maybeSyncReadyLabel(eventType, payload, target);
+    return outcome;
   }
 
   return async (event) => {

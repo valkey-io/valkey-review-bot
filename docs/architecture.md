@@ -14,6 +14,7 @@ security model in [SECURITY.md](../SECURITY.md).
 | Invoker | `webhook/src/invoker.ts`, `webhook/src/watchdog.ts` | One Lambda per review route and one for the curator, each fed by its own SQS queue |
 | Token broker | `webhook/src/token-broker.ts`, checks in `webhook/src/broker.ts` | One Lambda per reviewer, invoked by that reviewer's runtime |
 | Skills-repo token broker | `webhook/src/skills-repo-broker.ts` | One Lambda, created when `skillsRepo` is set, invoked by the curator only |
+| Ready-label reconciler | `webhook/src/ready-label-broker.ts`, logic in `webhook/src/ready-label.ts` | One Lambda, created when a route sets `readyLabel`, invoked by reviewer runtimes and the receiver. Never returns a token. |
 | Reviewers | `agents/common`, plus `agents/valkey-review` or `agents/valkey-glide-review` | One Bedrock AgentCore runtime and container image per reviewer |
 | Curator | `agents/curator`: feedback in `src/agent.ts`, skill maintenance in `src/maintenance.ts` | Its own AgentCore runtime |
 | Decay job and skill-maintenance scheduler | `ops/src/decay.ts`, `ops/src/releases.ts` | Lambda on a daily EventBridge schedule |
@@ -26,6 +27,7 @@ GitHub App webhook
 HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> GitHub (review, state comment)
                       |   (one per route)    ^               |    |
                       |                      |               |    +-> token broker (repo-scoped token)
+                      |                      |               |    +-> ready-label Lambda (pull_requests:write, never returned)
                       |                      +-- heartbeat --+
                       |                          table
                       |
@@ -61,7 +63,22 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    in its image, loads graduated skills and runs the model with its tools.
 5. The model ends with `post_review` (a `COMMENT` review with inline
    comments) or `skip_review`. Both rewrite the pull request's review state
-   comment.
+   comment. After a successful write, the runtime invokes the ready-label
+   Lambda when `READY_LABEL_FUNCTION` is set. New commits, close and
+   draft invoke it from the receiver before routing, so a routing timeout
+   still drops a stale label. Reopen, ready-for-review, thread
+   resolve/unresolve, and a review or issue comment on the pull request
+   (created, deleted or edited) invoke it after routing, including when
+   routing returned 500. GraphQL reports a bot's login without `[bot]`;
+   the reconciler matches the slug and requires the author to be a Bot.
+   The label is added only for an open non-draft PR with a completed
+   review at the current head. On ready, every thread this App started
+   is resolved or has a later human reply that does not @mention the bot.
+   On needs_work, an empty comment does not qualify: a thread this App
+   started must have been addressed that way, or a blocking PR-wide
+   finding or Direction must have a later human issue comment that does
+   not @mention the bot. Minors do not count. Otherwise the label is
+   removed.
 6. The runtime marks the heartbeat `completed` and sends a `done` event, and
    SQS deletes the message. If the worker's 15 minute limit ends its read
    first, later receives of the message decide from the heartbeat whether to
@@ -693,7 +710,8 @@ progress edits without a final edit.
 ### Token broker
 
 The GitHub App secret (`app_id`, `private_key`, `webhook_secret`) lives in
-Secrets Manager. Only the receiver and the token brokers can read it (the
+Secrets Manager. Only the receiver, the token brokers and the ready-label
+Lambda (when a route sets `readyLabel`) can read it (the
 skills-repo broker only when `skillsRepo.appSecretName` names this secret,
 which is the default). The
 receiver uses the webhook secret to verify deliveries and acts as the
@@ -718,6 +736,39 @@ without this check another installation of the App could give a token for
 a same-named repository of another owner. The broker then returns an installation token for that one
 repository with `pull_requests: write` and `metadata: read`, and its
 expiry. The installation check adds one GitHub call per token.
+
+### Ready-label Lambda
+
+When a route sets `readyLabel`, substrate creates one Lambda
+(`webhook/src/ready-label-broker.ts`) that the reviewer runtimes and the
+receiver may invoke. It never returns a token. The payload is
+`{ installation_id, repo, pr_number }`; the label name comes from
+`READY_LABEL_BY_REPO_JSON`. It uses the same installation and owner checks
+as the token broker, then mints `pull_requests: write` and
+`metadata: read` (`LABEL_PERMISSIONS` in `webhook/src/ready-label.ts`) and
+adds or removes that one label. GraphQL bot logins have no `[bot]`
+suffix; a thread counts only when the author is a Bot and the slug
+matches. A reply that @mentions the bot is not an answer. On
+`needs_work`, an empty state does not qualify, and a PR-wide minor does
+not count. A missing repository label is a 403 and is logged
+(`missing-label`), not created. Failed GitHub or Secrets Manager
+calls reject the Lambda invoke so the async Event retry can run them
+again; they never fail the webhook or the review. An older reconcile
+that raced a push re-reads the head before a mutation, and the head,
+comments and threads after one, so a resolve that races an unresolve
+(or a reply that races a deletion) does not leave the label on.
+ReadyLabelFn is reserved to one concurrent execution, which serializes
+async Event invokes; a throttled invoke is retried. If attempts run out
+after an add, the label is removed before returning `stale-head`.
+The same removal runs when a later read throws, and a new attempt does
+not start when the invocation has under ten seconds left. Async invokes
+that exhaust Lambda's retries go to the function's dead-letter queue.
+
+The reviewer token stays `pull_requests: write` + `metadata: read`, so
+code from the pull request can already add an existing label on that
+repository. This function decides the automatic projection. It does not
+create labels: the same permission gets a 403 when the name is missing
+from the repository.
 
 ### Skills-repo token broker
 
@@ -769,7 +820,8 @@ Each runtime has its own role (`infra/lib/valkey-review-agent-stack.ts`,
 `infra/lib/grants.ts`). A reviewer can call its models, get objects under
 its own prefix in the assets bucket (no listing) and decrypt them with the
 substrate key, read its own skills registry, get, put and update any item
-in the shared heartbeat table, invoke its own token broker, write its own
+in the shared heartbeat table, invoke its own token broker (and the
+ready-label Lambda when a route sets `readyLabel`), write its own
 runtime log groups, and pull from the CDK bootstrap container-assets
 repository, which holds the images of every CDK app in the account and
 region that uses the same bootstrap qualifier. It has no Secrets Manager
@@ -1370,10 +1422,10 @@ a registry check. The item records the checked file's commit in
 | Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer, and `curator/prompt.md`, `curator/skill.md` and `curator/skill-check.md`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
 | Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records, retired ones `DEPRECATED` | Curator (`submit_skill`, check edits, retirement) | That reviewer, the curator |
 | Curator registry (AWS Agent Registry) | Skill-writing guidance | `scripts/publish-curator-skills.mjs` | Curator (`list_skill_authoring`) |
-| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token brokers, and the skills-repo broker when `skillsRepo.appSecretName` names it |
+| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token brokers, the ready-label Lambda when a route sets `readyLabel`, and the skills-repo broker when `skillsRepo.appSecretName` names it |
 | Skills-repo App secret (Secrets Manager, optional) | `app_id` and `private_key` of the App that opens skill pull requests, when it is not the main App | Operator | Skills-repo broker |
 | SQS queues | Envelopes in flight (14 days), and dead-lettered messages | Receiver, SQS redrive | Workers, operators |
-| GitHub | Reviews, the review state comment (the carry-over between runs) and status comments | Reviewer runtimes, receiver (acknowledgements) | Reviewer runtimes, people |
+| GitHub | Reviews, the review state comment (the carry-over between runs), status comments, and the optional ready-for-human-review label | Reviewer runtimes, receiver (acknowledgements), ready-label Lambda | Reviewer runtimes, people |
 | Bot repository on GitHub (`skillsRepo.repo`) | The reviewers' repo skill files, and `skill-check/<reviewer>/<release>` branches and pull requests | Maintainers; the curator writes only `skill-check/` branches and their pull requests | Curator (anonymous reads), maintainers |
 | Container image | The repository clone each run fetches into. Warm containers keep gitignored build output between runs | Image build | Reviewer runtime |
 

@@ -9,7 +9,7 @@ secret names.
 
 | Stack | Contents |
 | --- | --- |
-| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
+| `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, the ready-label Lambda when a route sets `readyLabel`, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
 | `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
@@ -25,7 +25,8 @@ Each runtime has its own role:
     concerns tables, but the role has no DynamoDB access to them;
   - read its own skills registry;
   - get, put and update any item in the shared heartbeat table;
-  - invoke its own token broker;
+  - invoke its own token broker, and the ready-label Lambda when a route
+    sets `readyLabel`;
   - write its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`, for example
     `valkey_review_runtime-*`);
@@ -94,6 +95,11 @@ permissions are granted only when an `openai.*` model is configured.
    edits to the reviewers' skill files need an App with Contents on the
    bot's repository: this App by default, or a dedicated one; see
    [The skills-repo App](#the-skills-repo-app).
+   If a route sets `readyLabel`, subscribe the App to
+   `pull_request_review_thread`. It does not need Issues (write). Create
+   the label in each repository yourself; the bot never creates it.
+   Clearing `readyLabel` later is the two-step deploy under
+   [Rolling back](#rolling-back).
 4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
    JSON object:
@@ -226,6 +232,7 @@ reviewer. The token broker issues tokens only for these repositories.
 | `skipDrafts` | `false` | Draft pull requests are not reviewed when opened or pushed to; the review runs when the draft is marked ready. |
 | `mentionOnly` | `false` | No automatic reviews, on open, reopen or new commits. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
+| `readyLabel` | empty | GitHub label this route projects readiness onto (1–50 characters, no CR/LF, not whitespace-only). Empty turns the feature off, as a two-step deploy (see [Rolling back](#rolling-back)). The label is added when the PR is open and not a draft and this App has a completed review at the current head. On ready, every thread this App started is resolved or has a later human reply that does not @mention the bot. On `needs_work`, an empty comment does not qualify: a thread this App started must have been addressed that way, or a blocking PR-wide finding or Direction must have a later human issue comment that does not @mention the bot. Minors do not count. Missing, failed or stale reviews never count. Anything else removes that one label. The operator creates the label; a missing label is logged (`403`), not created. Requires a subscription to `pull_request_review_thread`, not Issues (write). |
 
 ### `curatorOnlyRoutes`
 
@@ -437,23 +444,35 @@ Then roll out the skill lifecycle in report mode
 ### Rolling back
 
 A straight `npx cdk deploy --all` of an earlier version fails at its first
-stack. This version adds two cross-stack imports: `ValkeyReviewerDecay`
-imports the curator queue from `ValkeyReviewWebhook`, and, with
-`skillsRepo` set, `ValkeyReviewerCurator` imports the skills-repo broker
-from `ValkeyReviewerSubstrate`. An earlier version deploys the substrate
-and webhook stacks first, and CloudFormation refuses to delete an export
-that another stack still imports. From a checkout of the earlier version:
+stack. This version adds cross-stack imports: `ValkeyReviewerDecay`
+imports the curator queue from `ValkeyReviewWebhook`, with `skillsRepo`
+set `ValkeyReviewerCurator` imports the skills-repo broker from
+`ValkeyReviewerSubstrate`, and with `readyLabel` set `ValkeyReviewWebhook`,
+`ValkeyReviewAgent` and `ValkeyGlideReviewAgent` import ReadyLabelFn from
+`ValkeyReviewerSubstrate`. An earlier version deploys the substrate and
+webhook stacks first, and CloudFormation refuses to delete an export that
+another stack still imports. From a checkout of the earlier version:
 
 1. Remove from `deploy.config.json` the keys that version does not know,
    since its parser rejects unknown keys: `skillLifecycle`, `skillsRepo`,
-   `maxAutomaticReviewsPerPr`, `pushReviewDelaySeconds` and
-   `decay.graduatedHalfLifeDays`.
+   `maxAutomaticReviewsPerPr`, `pushReviewDelaySeconds`,
+   `decay.graduatedHalfLifeDays` and `readyLabel`.
 2. Deploy the two importing stacks first, which drops the imports, then
    the rest:
    ```sh
-   npx cdk deploy ValkeyReviewerDecay ValkeyReviewerCurator --exclusively
+   npx cdk deploy ValkeyReviewerDecay ValkeyReviewerCurator ValkeyReviewWebhook ValkeyReviewAgent ValkeyGlideReviewAgent --exclusively
    npx cdk deploy --all
    ```
+
+Clearing `readyLabel` on a deployment that already has the function is
+the same shape as removing `skillsRepo`. `ValkeyReviewWebhook`,
+`ValkeyReviewAgent` and `ValkeyGlideReviewAgent` import ReadyLabelFn.
+Deploy those three with `--exclusively` first, then `--all`:
+
+```sh
+npx cdk deploy ValkeyReviewWebhook ValkeyReviewAgent ValkeyGlideReviewAgent --exclusively
+npx cdk deploy --all
+```
 
 The earlier decay job decays every concern record on `decay.halfLifeDays`
 and deletes it below the floor, graduated records and tombstones included.
@@ -653,7 +672,10 @@ Contents either way: the receiver for `pull_requests: write`,
 `issues: read` and `metadata: read` (`RECEIVER_TOKEN_PERMISSIONS` in
 `webhook/src/github.ts`), and the reviewer brokers for
 `pull_requests: write` and `metadata: read`. So their tokens, and the
-reviewer runtimes, never get Contents permission.
+reviewer runtimes, never get Contents permission. The ready-label Lambda,
+when a route sets `readyLabel`, asks for `pull_requests: write` and
+`metadata: read` itself and never returns that token. A missing label
+is a 403 from GitHub, not a label the function creates.
 
 The commits are made with the broker's token, so GitHub authors them as
 the App's bot user. Their `Signed-off-by` line is `skillsRepo.signOff`, or
@@ -791,6 +813,12 @@ limits, which are in the code named below:
 - Receiver: 10 reserved concurrent executions. Reserving concurrency needs
   enough unreserved account concurrency; a new account with a low Lambda
   quota may need an increase first.
+- Ready-label Lambda: 1 reserved concurrent execution when a route sets
+  `readyLabel`. Async Event invokes that arrive while it is busy are
+  throttled and retried. It shares the same unreserved pool as the receiver.
+  Invokes that still fail after Lambda's retries land on its dead-letter
+  queue. Alarm on `ApproximateNumberOfMessagesVisible` above 0 for that
+  queue, as for the other dead-letter queues.
 - HTTP API: 20 requests per second, burst 40. GitHub does not retry a
   throttled delivery by itself; you can redeliver it from the App's
   advanced settings.

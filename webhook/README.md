@@ -8,6 +8,7 @@ The Lambda functions between GitHub and the AgentCore runtimes.
 | `src/invoker.ts` | One worker per queue. Forwards each message to its AgentCore runtime and, for reviews, uses SQS redelivery to watch over long runs. |
 | `src/token-broker.ts` | Gives a reviewer runtime a short-lived installation token for the one repository it reviews. The checks are in `src/broker.ts`. |
 | `src/skills-repo-broker.ts` | Gives the curator a short-lived token for the bot's own repository, to open pull requests that propose edits to the reviewers' skill files. Deployed only when `skillsRepo` is configured. |
+| `src/ready-label-broker.ts` | Projects this App's review readiness onto one configured PR label. Mints `pull_requests: write` itself and never returns a token. Deployed only when a route sets `readyLabel`. |
 
 `infra/lib/webhook-stack.ts` and `infra/lib/substrate-stack.ts` deploy them
 and set the environment below.
@@ -98,7 +99,8 @@ redelivered from the App's advanced settings.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `REVIEW_ROUTE_MAP_JSON` | required | Review routes keyed by repository full name: `{ routeId, queueUrl, reviewerId, authorAllowlist?, mentionOnly?, skipDrafts?, threadReplyReview? }`. |
+| `REVIEW_ROUTE_MAP_JSON` | required | Review routes keyed by repository full name: `{ routeId, queueUrl, reviewerId, authorAllowlist?, mentionOnly?, skipDrafts?, threadReplyReview?, readyLabel? }`. |
+| `READY_LABEL_FUNCTION` | none | Ready-label Lambda. Unset when no route sets `readyLabel`. The receiver invokes it asynchronously on `synchronize`, `closed` and `converted_to_draft` before routing, and after routing on `ready_for_review` / `reopened`, `pull_request_review_thread` resolved/unresolved, and `pull_request_review_comment` or `issue_comment` `created` / `deleted` / `edited` on a pull request. The after-routing invoke still runs when review routing returned 500. A failed invoke is logged and never returns 500. |
 | `CURATOR_ROUTE_MAP_JSON` | `{}` | Repositories whose feedback reaches the curator, keyed by full name: `{ reviewerId }`. |
 | `CURATOR_QUEUE_URL` | empty | Curator queue. Empty means feedback is not forwarded. |
 | `IDEMPOTENCY_TABLE` | required | DynamoDB table keyed by `key`, with TTL attribute `ttl`. Holds delivery keys (24 hours), the daily review counters `budget#ROUTEID#YYYY-MM-DD` (UTC, 3 days), the round counters `autoreviews#owner/name#pr` (180 days from the latest automatic review) and the pending markers `pending#owner/name#pr` (an hour after the queue delay). |
@@ -196,6 +198,38 @@ wires them to the App key.
 | `GITHUB_SECRET_ARN` | Secrets Manager secret with `private_key`. |
 | `GITHUB_APP_ID` | The App ID. |
 | `ALLOWED_REPOS_JSON` | JSON array of the repositories a token may be issued for. |
+
+## Ready-label Lambda
+
+Created only when at least one route sets `readyLabel`. Reviewer runtimes
+invoke it after a successful state-comment write, and the receiver invokes
+it on the events above. A request is `{ installation_id, repo, pr_number }`.
+The function refuses it unless `repo` is in `ALLOWED_REPOS_JSON` and GitHub,
+asked as the App, reports `installation_id` as the App's installation on
+that repository, owned by `owner`. It then mints a token with
+`pull_requests: write` and `metadata: read`, reads the PR, the sticky
+state comment (`<!-- valkey-reviewer:state -->`) and this App's review
+threads, and adds or removes the label named in
+`READY_LABEL_BY_REPO_JSON`. The token is never returned. GraphQL returns
+a bot login without `[bot]`; the slug is compared and the author must be
+a Bot. A 403 whose message refuses to create labels means the operator
+has not created it (`missing-label`); the function does not create
+labels. Other 403s reject. Validation refusals resolve as `{ error }`.
+Operational failures (GitHub, Secrets Manager) reject the invoke so
+Lambda retries the async Event. Retries that are exhausted go to the
+function's dead-letter queue.
+
+The App needs a webhook subscription to `pull_request_review_thread`.
+It does not need Issues (write).
+
+| Variable | Meaning |
+| --- | --- |
+| `GITHUB_SECRET_ARN` | Secrets Manager secret with `private_key`. |
+| `GITHUB_APP_ID` | The App ID. |
+| `BOT_LOGIN` | The App's bot login, for matching the state comment and threads this App started. |
+| `ALLOWED_REPOS_JSON` | JSON array of repositories a label may be written on. |
+| `READY_LABEL_BY_REPO_JSON` | JSON object mapping `owner/name` to the label name. |
+| `KNOWN_BOT_LOGINS` | Same meaning as the receiver. Unset keeps the built-in list. |
 
 ## Skills-repo token broker
 

@@ -6,25 +6,34 @@ import * as kms from 'aws-cdk-lib/aws-kms';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import * as destinations from 'aws-cdk-lib/aws-lambda-destinations';
 import * as nodelambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as path from 'node:path';
 import type { GitHubConfig, ReviewerId, SkillsRepoConfig } from './deployment-config';
 
 export interface SubstrateStackProps extends cdk.StackProps {
-  readonly github: Pick<GitHubConfig, 'appId' | 'appSecretName'>;
+  readonly github: Pick<GitHubConfig, 'appId' | 'appSecretName' | 'botLogin' | 'knownBotLogins'>;
   /** Per reviewer, the repositories ("owner/name") its token broker may issue tokens for. */
   readonly allowedRepos: Readonly<Record<ReviewerId, readonly string[]>>;
   /** The bot's own repository. When set, a token broker for it is created for the curator. */
   readonly skillsRepo?: Pick<SkillsRepoConfig, 'repo' | 'appSecretName'>;
+  /**
+   * Repositories that project readiness onto a GitHub label. When non-empty,
+   * a ReadyLabelFn is created that mints pull_requests:write itself and
+   * never returns a token.
+   */
+  readonly readyLabels?: Readonly<Record<string, string>>;
 }
 
 /**
  * Resources shared by every agent in one account and region: the KMS key,
  * the prompt and skill bucket, the GitHub App secret, one token broker per
- * reviewer, the skills-repo token broker when configured, and the run
- * heartbeat table. Each agent stack creates its own execution role and
- * grants it only what that agent uses.
+ * reviewer, the skills-repo token broker when configured, the ready-label
+ * Lambda when a route sets readyLabel, and the run heartbeat table. Each
+ * agent stack creates its own execution role and grants it only what that
+ * agent uses.
  */
 export class SubstrateStack extends cdk.Stack {
   readonly key: kms.Key;
@@ -34,6 +43,11 @@ export class SubstrateStack extends cdk.Stack {
   readonly tokenBrokers: ReadonlyMap<ReviewerId, lambda.IFunction>;
   /** Issues tokens for the bot's own repository; set only when skillsRepo is configured. */
   readonly skillsRepoTokenBroker?: lambda.IFunction;
+  /**
+   * Projects this App's review readiness onto a PR label. Set only when
+   * at least one route has readyLabel.
+   */
+  readonly readyLabelFn?: lambda.IFunction;
 
   constructor(scope: Construct, id: string, props: SubstrateStackProps) {
     super(scope, id, props);
@@ -139,6 +153,46 @@ export class SubstrateStack extends cdk.Stack {
       }));
       this.skillsRepoTokenBroker = broker;
       new cdk.CfnOutput(this, 'SkillsRepoTokenBrokerFunctionName', { value: broker.functionName });
+    }
+
+    // This function mints pull_requests:write itself and never returns a
+    // token. It is created only when a route sets readyLabel. The reviewer
+    // token already has that permission for the repository under review;
+    // this function is the automatic projection, not a second capability.
+    const readyLabels = props.readyLabels ?? {};
+    const labeledRepos = Object.keys(readyLabels);
+    if (labeledRepos.length > 0) {
+      const dlq = new sqs.Queue(this, 'ReadyLabelDlq', { retentionPeriod: cdk.Duration.days(14) });
+      const fn = new nodelambda.NodejsFunction(this, 'ReadyLabelFn', {
+        entry: path.join(webhookRoot, 'src', 'ready-label-broker.ts'),
+        depsLockFilePath: path.join(webhookRoot, 'package-lock.json'),
+        runtime: lambda.Runtime.NODEJS_24_X,
+        architecture: lambda.Architecture.ARM_64,
+        timeout: cdk.Duration.seconds(30),
+        memorySize: 256,
+        // One isolate at a time: async Event invokes cannot overlap a POST
+        // with a DELETE on the same PR. A throttled Event is retried.
+        reservedConcurrentExecutions: 1,
+        onFailure: new destinations.SqsDestination(dlq),
+        description: 'Projects this App\'s review readiness onto a configured pull request label.',
+        environment: {
+          GITHUB_SECRET_ARN: this.githubAppSecret.secretArn,
+          GITHUB_APP_ID: props.github.appId,
+          BOT_LOGIN: props.github.botLogin,
+          ALLOWED_REPOS_JSON: JSON.stringify(labeledRepos),
+          READY_LABEL_BY_REPO_JSON: JSON.stringify(readyLabels),
+          ...(props.github.knownBotLogins?.length ? { KNOWN_BOT_LOGINS: props.github.knownBotLogins.join(',') } : {}),
+        },
+        logGroup: new logs.LogGroup(this, 'ReadyLabelFnLogs', { retention: logs.RetentionDays.ONE_MONTH }),
+        bundling: { externalModules: ['@aws-sdk/*'], target: 'node24', minify: false, sourceMap: true },
+      });
+      this.githubAppSecret.grantRead(fn);
+      this.readyLabelFn = fn;
+      new cdk.CfnOutput(this, 'ReadyLabelFunctionName', { value: fn.functionName });
+      new cdk.CfnOutput(this, 'ReadyLabelDeadLetterQueueName', {
+        value: dlq.queueName,
+        description: 'Dead-letter queue for ready-label invokes that exhaust Lambda retries. Alarm on AWS/SQS ApproximateNumberOfMessagesVisible > 0 with dimension QueueName.',
+      });
     }
 
     // Liveness record for long reviews. The runtime updates last_activity
