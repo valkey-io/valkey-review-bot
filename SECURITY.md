@@ -12,7 +12,8 @@ review runtime is treated as running untrusted code. The design keeps credential
 away from it:
 
 - The GitHub App private key and webhook secret are stored in AWS Secrets
-  Manager. Only the webhook receiver and the token brokers can read them. The
+  Manager. Only the webhook receiver, the token brokers and the thread
+  resolver can read them. The
   receiver verifies deliveries and acts as the App for permission checks,
   acknowledgement comments and reading pull requests. Its installation tokens
   ask for `pull_requests: write`, `issues: read` and `metadata: read` only, so
@@ -23,8 +24,30 @@ away from it:
   GitHub, as the App, for the App's installation on that repository and refuses
   the request unless it is the installation the runtime named, owned by the
   repository's owner. The runtime cannot read the App key, and cannot get tokens
-  for repositories that are not routed to that reviewer. No reviewer token
-  carries `contents` permission, and the reviewer App needs none.
+  for repositories that are not routed to that reviewer. No token a
+  reviewer runtime holds carries `contents` permission, and reviews need
+  none.
+- A review resolves its own review threads once their findings are fixed.
+  GitHub lets only a token with `contents: write` resolve a thread, so the
+  thread resolver (`webhook/src/thread-resolver.ts`) mints one for the
+  repository, resolves only open threads whose first comment is the App's
+  and whose other comments are the App's or the pull request author's, and
+  never returns the token. The runtime names only the threads. The
+  repository, the pull request and the installation come from a grant the
+  queue worker writes for the run, under a random value only that run is
+  given; the receiver's table holds only its hash, and no reviewer role can
+  read that table. Code from a pull request can call the resolver too, but
+  only with its own run's grant, so it can resolve threads only on the pull
+  request under review, whose author can already resolve every
+  conversation on it. That code can still make the App post on another
+  pull request with the token it holds, a forged state comment included,
+  which that pull request's own run then reads; because a thread with
+  anyone else's reply is never resolved, it cannot use that to hide a
+  person's reply. Resolving needs Contents (read and write) on the
+  App. Its private key, which the receiver, the brokers and the resolver
+  can read, can then mint `contents: write` tokens for every repository the
+  App is installed on. Without Contents on an installation, the threads
+  stay open and reviews work as before.
 - When the deployment proposes edits to the reviewers' built-in skill files,
   a separate skills-repo token broker gives the curator, and only the curator,
   a short-lived token for the bot's own repository, with `contents: write`,
@@ -36,13 +59,11 @@ away from it:
   of that repository that its branch protection rules allow, so protect the base
   branch and require reviews on it. The curator runs no code from a pull
   request or from upstream, has no shell, and its model never sees the token.
-  Use a small App of its own for this, installed only on the bot repository.
   The receiver and the reviewer brokers ask for explicit permissions without
-  `contents`, so with the reviewer App here none of their tokens carries it.
-  But every account the reviewer App is installed on would have to grant it
-  Contents write, and its private key, which the receiver and the reviewer
-  brokers can read, could then mint `contents: write` tokens for every
-  repository the App is installed on.
+  `contents`, so none of their tokens carries it, whichever App is used
+  here. A reviewer App without Contents can use a small App of its own for
+  this, installed only on the bot repository; thread resolution needs
+  Contents on the reviewer App anyway (above).
 - Git authenticates each fetch with a per-process header. No token is written to
   the repository's `.git/config`.
 - Build and test processes the reviewer starts get an environment with AWS,
@@ -71,7 +92,9 @@ away from it:
     budget is used up, after which the review runs anyway; under a review's
     own run key, it keeps that review from starting, and the review can end
     without running, in the dead-letter queue or as `[abandoned]`;
-  - invoke on its own token broker;
+  - invoke on its own token broker, and on the thread resolver, which
+    resolves the App's threads only on the pull request the run's grant
+    names;
   - log writes to its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`);
   - image pulls from the CDK bootstrap container-assets repository. ECR cannot

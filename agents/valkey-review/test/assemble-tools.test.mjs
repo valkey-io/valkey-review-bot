@@ -12,11 +12,12 @@ const ctx = (workspacePath) => ({
 // assembleTools must hand onTerminal to the common tools. Without it the
 // run cannot tell when the review was posted, and run-agent refuses to
 // start the model. A type-check cannot catch a missing optional field.
-test('assembleTools wires the terminal callback into the common tools', async () => {
+test('assembleTools wires the terminal callback and the thread resolver into the common tools', async () => {
   const { assembleTools } = await import('../src/tools/index.ts');
-  const { isTerminalCallbackWired } = await import('../../common/src/tools/gh.ts');
+  const { isTerminalCallbackWired, isThreadResolverWired } = await import('../../common/src/tools/gh.ts');
   const workspacePath = mkdtempSync(path.join(tmpdir(), 'assemble-tools-'));
   const onTerminal = () => {};
+  const threadResolver = { resolve: async (ids) => ids };
   const tools = await assembleTools({
     ctx: ctx(workspacePath),
     octokit: {},
@@ -24,9 +25,11 @@ test('assembleTools wires the terminal callback into the common tools', async ()
     allowWrite: false,
     env: {},
     onTerminal,
+    threadResolver,
   });
   assert.ok(tools.length > 0);
   assert.equal(isTerminalCallbackWired(onTerminal), true);
+  assert.equal(isThreadResolverWired(threadResolver), true);
 });
 
 /** Every tool the agent can get: writes allowed and the make tool on. */

@@ -8,7 +8,7 @@ import { createServer } from 'node:net';
 import { createAppAuth } from '@octokit/auth-app';
 
 const {
-  boundedRequest, createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, parseAppSecret,
+  boundedRequest, createAppSecretSource, createInstallationTokens, fetchAppSlug, fetchReviewComment, githubApi, parseAppSecret,
   RECEIVER_TOKEN_PERMISSIONS,
 } = await import('../src/github.ts');
 
@@ -79,7 +79,9 @@ test('githubApi tolerates an empty body', async () => {
 
 test('fetchReviewComment returns the comment author, anchor and body', async () => {
   const api = async () => ({ status: 200, json: { body: 'b', user: { login: 'u' }, path: 'p.c', line: null, original_line: 3 } });
-  assert.deepEqual(await fetchReviewComment(api, 'o/r', 1), { body: 'b', author: 'u', path: 'p.c', line: 3 });
+  assert.deepEqual(await fetchReviewComment(api, 'o/r', 1), { body: 'b', author: 'u', path: 'p.c', line: 3, originalLine: 3 });
+  const moved = async () => ({ status: 200, json: { body: 'b', path: 'p.c', line: 12, original_line: 3 } });
+  assert.deepEqual(await fetchReviewComment(moved, 'o/r', 1), { body: 'b', path: 'p.c', line: 12, originalLine: 3 });
   assert.equal(await fetchReviewComment(async () => ({ status: 404, json: {} }), 'o/r', 1), undefined);
 });
 
@@ -107,6 +109,12 @@ test('githubApi fails a call whose body is cut off instead of reading it as empt
   });
   const api = githubApi('tok', async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
   await assert.rejects(api('GET', 'repos/o/r/installation'), (err) => err.name === 'TimeoutError');
+});
+
+test('fetchAppSlug reads the App\'s slug', async () => {
+  assert.equal(await fetchAppSlug(async () => ({ status: 200, json: { slug: 'review-bot' } })), 'review-bot');
+  await assert.rejects(fetchAppSlug(async () => ({ status: 200, json: {} })), /no slug/);
+  await assert.rejects(fetchAppSlug(async () => ({ status: 401, json: {} })), /returned 401/);
 });
 
 /** A TCP server that accepts every connection and never answers. */

@@ -99,6 +99,12 @@ export interface InvokerConfig {
    * by the run's start record (src/watchdog.ts).
    */
   readonly idempotencyTable: string;
+  /**
+   * The thread resolver (src/thread-resolver.ts), on review workers. Each
+   * run gets a grant for its pull request (src/invoker.ts). Empty on the
+   * curator's worker; a review run without it leaves its threads open.
+   */
+  readonly threadResolverFunction: string;
 }
 
 function required(env: Env, name: string): string {
@@ -217,6 +223,7 @@ export function loadInvokerConfig(env: Env): InvokerConfig {
     runBudgetMs: integer(env, 'RUN_BUDGET_MINUTES', DEFAULT_RUN_BUDGET_MINUTES, 1) * 60_000,
     staleMs: integer(env, 'HEARTBEAT_STALE_MINUTES', DEFAULT_HEARTBEAT_STALE_MINUTES, 1) * 60_000,
     idempotencyTable: env.IDEMPOTENCY_TABLE?.trim() ?? '',
+    threadResolverFunction: env.THREAD_RESOLVER_FUNCTION?.trim() ?? '',
   };
 }
 

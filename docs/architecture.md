@@ -13,6 +13,7 @@ security model in [SECURITY.md](../SECURITY.md).
 | Receiver | `webhook/src/receiver.ts`, logic in `webhook/src/delivery.ts` | Lambda behind an API Gateway HTTP API (`POST /webhook`) |
 | Invoker | `webhook/src/invoker.ts`, `webhook/src/watchdog.ts` | One Lambda per review route and one for the curator, each fed by its own SQS queue |
 | Token broker | `webhook/src/token-broker.ts`, checks in `webhook/src/broker.ts` | One Lambda per reviewer, invoked by that reviewer's runtime |
+| Thread resolver | `webhook/src/thread-resolver.ts`, checks in `webhook/src/resolver.ts` | One Lambda in the webhook stack, invoked by the reviewer runtimes with their run's grant |
 | Skills-repo token broker | `webhook/src/skills-repo-broker.ts` | One Lambda, created when `skillsRepo` is set, invoked by the curator only |
 | Reviewers | `agents/common`, plus `agents/valkey-review` or `agents/valkey-glide-review` | One Bedrock AgentCore runtime and container image per reviewer |
 | Curator | `agents/curator`: feedback in `src/agent.ts`, skill maintenance in `src/maintenance.ts` | Its own AgentCore runtime |
@@ -26,6 +27,7 @@ GitHub App webhook
 HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> GitHub (review, state comment)
                       |   (one per route)    ^               |    |
                       |                      |               |    +-> token broker (repo-scoped token)
+                      |                      |               |    +-> thread resolver (the run's own fixed threads)
                       |                      +-- heartbeat --+
                       |                          table
                       |
@@ -50,9 +52,10 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
    delay when new commits or a new base branch started it.
 3. The route's worker waits while another review of the same pull request
    runs, at most until the review's run budget is used up. Then it writes
-   the run's start record, removes the pending marker, calls
+   the run's start record, removes the pending marker, writes the run's
+   resolve grant (see [Thread resolver](#thread-resolver)), calls
    `InvokeAgentRuntime` on the route's reviewer runtime with the envelope
-   as the payload and reads the event stream (`handleOne` in
+   and the grant as the payload and reads the event stream (`handleOne` in
    `webhook/src/invoker.ts`).
 4. The runtime (`bootstrap` in `agents/common/src/run-agent.ts`) starts a
    heartbeat record, gets a token from its token broker and reads the pull
@@ -237,7 +240,8 @@ waiting review clears the mark and takes the round again
 (`clearRoundGivenBack`), since the pull request is back and the review
 runs. The worker gives nothing back: a review it gives up on, past the run
 budget or in the dead-letter queue, keeps its round and slot, because the
-worker's grant on the idempotency table covers `pending#` keys only. In
+worker's grants on the idempotency table cover `pending#` keys, and writes
+of `resolve#` keys (see [Thread resolver](#thread-resolver)), only. In
 the seconds between the worker starting a review and the runtime reading
 the pull request, a leaving event finds no review waiting, so a review the
 runtime then skips keeps its round; and a pull request that left while the
@@ -646,8 +650,9 @@ state are capped at 60,000 characters, and the state must pass
   changes. On automatic runs a non-empty `body` becomes the review body. On
   @mention runs the body goes to the status comment instead, and no review
   object is created when there are no inline comments. It then writes the
-  state comment.
-- `skip_review` writes only the state comment.
+  state comment and resolves the threads of fixed findings (below).
+- `skip_review` writes only the state comment, and resolves the threads of
+  fixed findings.
 
 A failed review submission gives the gate back. When GitHub answered it with
 a server error, or not at all, the review may be there anyway: GitHub stops a
@@ -684,9 +689,10 @@ findings or a non-empty `direction`, `needs_work` with neither, and a
 release lines found for this run. `renderReviewState` produces the comment,
 so its shape is the same across runs and models. Its last line is an HTML
 comment that only the runtime writes, after all model text:
-`<!-- valkey-reviewer:heads {"head":...,"base":...,"full_review":...,"full_review_base":...} -->`
+`<!-- valkey-reviewer:heads {"head":...,"base":...,"full_review":...,"full_review_base":...,"open_locations":[...]} -->`
 holds the full head SHA, the base branch, the latest head a full review
-covered and the base that review was against. An automatic review is a full review, unless its
+covered, the base that review was against, and the `path:line` of each open
+finding that names a line. An automatic review is a full review, unless its
 terminal call sets `full_review: false` or the model call limit stopped it.
 An @mention run is one when its terminal call sets `full_review: true` and
 the limit did not stop it. Any other run carries the previous full review
@@ -701,6 +707,34 @@ matches any base. `fullyReviewed` reads it that way: the head starts with
 edits the previous comment, or creates a new one when the old one returns 404
 or a 403 that is not rate limiting; a retried terminal call edits the comment
 the run already created.
+
+Once the state comment is written, the terminal tool resolves this App's open
+review threads whose finding this run fixed: open in the previous state
+comment, resolved in the new one. A finding's `location` is the `path:line`
+its inline comment was posted at, the last line of a multi-line comment (the
+overview lists each comment at that line, then where the line is at the
+head). A thread is named by a finding on the line it was posted on; failing
+that, by the one finding on the other lines it was posted on (start line to
+line), except lines another of the App's threads was posted on; failing
+that, by a finding on the line it is on now. GraphQL's `startLine` is not
+used: it stays on the old start line when a thread moves. A thread
+qualifies when no open finding names it and the finding naming it is
+resolved now and was open in the previous state. A finding the previous
+state had open on the posted line, and the new state names only on the line
+the thread is on now, moved and counts too. The previous state's open
+findings come from its heads line, which model text cannot reach; a comment
+from before that line is read from its list. Left alone are threads
+someone else started, threads anyone but the App and the pull request's
+author commented in, and the threads of the review the same call posted.
+A finding fixed
+in an earlier run is not looked at again, so a thread a person reopened
+stays open, and threads are never reopened: a person who resolves one has
+answered it. GitHub lets only a token with `contents: write` resolve a
+thread, so the runtime lists the threads with its own token and asks the
+thread resolver to resolve them, with the grant its worker gave the run
+(below). A run without a grant leaves them open. A failure is logged and
+does not fail the call. It is not tried again: the next run does not see the finding open,
+so the thread stays open.
 
 ### The status comment on @mention runs
 
@@ -724,9 +758,9 @@ progress edits without a final edit.
 ### Token broker
 
 The GitHub App secret (`app_id`, `private_key`, `webhook_secret`) lives in
-Secrets Manager. Only the receiver and the token brokers can read it (the
-skills-repo broker only when `skillsRepo.appSecretName` names this secret,
-which is the default). The
+Secrets Manager. Only the receiver, the token brokers and the thread
+resolver can read it (the skills-repo broker only when
+`skillsRepo.appSecretName` names this secret, which is the default). The
 receiver uses the webhook secret to verify deliveries and acts as the
 installation for @mention handling and thread lookups, with tokens that ask
 for `pull_requests: write`, `issues: read` and `metadata: read` only
@@ -749,6 +783,41 @@ without this check another installation of the App could give a token for
 a same-named repository of another owner. The broker then returns an installation token for that one
 repository with `pull_requests: write` and `metadata: read`, and its
 expiry. The installation check adds one GitHub call per token.
+
+### Thread resolver
+
+`webhook/src/thread-resolver.ts`, with the checks in
+`webhook/src/resolver.ts`, in the webhook stack. A review calls it to
+resolve its own fixed threads (see [The review state comment](#the-review-state-comment)).
+GitHub lets only a token with `contents: write` resolve a thread, and code
+from the pull request under review can read the runtime's tokens, so the
+resolver mints that token and never returns it.
+
+Code from the pull request can call the resolver too, so the caller names
+only threads: `{ grant, thread_ids }`, at most 50 ids. Just before it
+invokes a review, the queue worker draws a random grant, writes
+`resolve#<sha256 of the grant>` to the idempotency table with the
+envelope's repository, pull request and installation and a two-hour expiry
+(the session's longest life), and adds `thread_resolver: { function_name,
+grant }` to the payload (`webhook/src/invoker.ts`). Only that run's session
+gets the value, the table holds only its hash, and no reviewer role can
+read the table. The resolver looks the grant up, checks the App's
+installation on the repository as the token broker does, mints a token for
+that one repository with `contents: write`, `pull_requests: write` and
+`metadata: read`, reads the threads and resolves only unresolved ones whose
+first comment is the App's bot and whose other comments are the App's or
+the pull request author's, on that open pull request. It returns
+`{ resolved: [ids] }`. So a run can resolve threads only on the pull request
+it reviews, whose author can already resolve every conversation on it. The
+author rule covers what the grant cannot: with the App token it holds, code
+from a pull request can still make the App post on another pull request,
+a forged state comment included, which that pull request's own run then
+reads. A thread with anyone else's reply is never resolved, so such a
+reply stays in view. An
+installation that does not grant Contents write makes the token request
+fail; the resolver returns an error, and the threads stay open. The
+reviewer runtime roles may invoke it through its resource policy, so the
+reviewer stacks take nothing from the webhook stack.
 
 ### Skills-repo token broker
 
@@ -800,7 +869,8 @@ Each runtime has its own role (`infra/lib/valkey-review-agent-stack.ts`,
 `infra/lib/grants.ts`). A reviewer can call its models, get objects under
 its own prefix in the assets bucket (no listing) and decrypt them with the
 substrate key, read its own skills registry, get, put and update any item
-in the shared heartbeat table, invoke its own token broker, write its own
+in the shared heartbeat table, invoke its own token broker and the thread
+resolver, write its own
 runtime log groups, and pull from the CDK bootstrap container-assets
 repository, which holds the images of every CDK app in the account and
 region that uses the same bootstrap qualifier. It has no Secrets Manager
@@ -1395,13 +1465,13 @@ a registry check. The item records the checked file's commit in
 
 | Store | Holds | Written by | Read by |
 | --- | --- | --- | --- |
-| Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review) and pending markers `pending#owner/name#<pr>` (an hour after the queue delay) | Receiver; review workers extend and delete pending markers | Receiver, review workers (pending markers) |
+| Idempotency table (DynamoDB, webhook stack) | Delivery keys (24 hour TTL), daily budget counters `budget#<route>#<date>` (3 day TTL), round counters `autoreviews#owner/name#<pr>` (180 days from the latest automatic review), pending markers `pending#owner/name#<pr>` (an hour after the queue delay) and resolve grants `resolve#<hash>` (two hours) | Receiver; review workers extend and delete pending markers and write resolve grants | Receiver, review workers (pending markers), thread resolver (resolve grants) |
 | `valkey_reviewer_run_heartbeat` (DynamoDB, substrate stack) | One item per run key: `last_activity`, `status`, `model`, `message_id`, 24 hour TTL | Reviewer runtimes; review workers write each run's start record | Review workers |
 | `valkey_review_concerns`, `valkey_glide_review_concerns` (DynamoDB, reviewer stacks) | Concern records with their skill lifecycle attributes (tombstones included), and the `#maintenance` / `repo-skill` item. Customer-managed KMS key, point-in-time recovery, retained on stack deletion | Curator, decay job, `scripts/skill-check.mjs` (claims), `scripts/registry-skills.mjs adopt --apply` (records for orphaned skills) | Curator, decay job, `scripts/concerns-dump.sh`, `scripts/skill-check.mjs`, `scripts/registry-skills.mjs orphans` and `adopt` |
 | Assets bucket (S3, substrate stack) | `<agent>/prompt.md` and `<agent>/skill.md` for each reviewer, and `curator/prompt.md`, `curator/skill.md` and `curator/skill-check.md`. KMS encrypted and versioned | CDK deploy | Each runtime reads its own prefix at container start |
 | Reviewer skills registries (AWS Agent Registry, one per reviewer) | Graduated `SKILL` records, retired ones `DEPRECATED` | Curator (`submit_skill`, check edits, retirement) | That reviewer, the curator |
 | Curator registry (AWS Agent Registry) | Skill-writing guidance | `scripts/publish-curator-skills.mjs` | Curator (`list_skill_authoring`) |
-| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token brokers, and the skills-repo broker when `skillsRepo.appSecretName` names it |
+| GitHub App secret (Secrets Manager) | `app_id`, `private_key`, `webhook_secret`. Created by the operator and referenced by name, so a deploy never replaces it | Operator | Receiver, token brokers, the thread resolver, and the skills-repo broker when `skillsRepo.appSecretName` names it |
 | Skills-repo App secret (Secrets Manager, optional) | `app_id` and `private_key` of the App that opens skill pull requests, when it is not the main App | Operator | Skills-repo broker |
 | SQS queues | Envelopes in flight (14 days), and dead-lettered messages | Receiver, SQS redrive | Workers, operators |
 | GitHub | Reviews, the review state comment (the carry-over between runs) and status comments | Reviewer runtimes, receiver (acknowledgements) | Reviewer runtimes, people |

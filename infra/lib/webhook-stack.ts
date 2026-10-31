@@ -57,6 +57,8 @@ export interface WebhookStackProps extends cdk.StackProps {
   readonly github: Pick<GitHubConfig, 'botLogin' | 'installationId' | 'knownBotLogins'>;
   /** Review workers read it on redelivery to tell slow runs from dead ones. */
   readonly heartbeatTable: dynamodb.ITable;
+  /** The reviewer runtimes' roles, by reviewer id: they may call the thread resolver. */
+  readonly reviewerRoles: ReadonlyMap<string, iam.IRole>;
   /** Repositories the reviewers post on. The curator learns from them too. */
   readonly routes: readonly WebhookRoute[];
   /** More repositories the curator learns from, where no reviewer ever runs. */
@@ -175,6 +177,45 @@ export class WebhookStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN,
     });
 
+    // Resolves a review's own fixed threads (src/thread-resolver.ts). It
+    // reads the App key, and a run's grant from the idempotency table:
+    // only items under resolve#, which the review workers write. The
+    // reviewer runtimes call it, so code from a pull request can too; the
+    // grant limits a run to its own pull request (src/resolver.ts).
+    const threadResolver = new nodelambda.NodejsFunction(this, 'ThreadResolverFn', {
+      entry: path.join(webhookSrc, 'thread-resolver.ts'),
+      runtime: lambda.Runtime.NODEJS_24_X,
+      architecture: lambda.Architecture.ARM_64,
+      // Up to five GitHub calls in a row, each bounded at 8 seconds
+      // (src/github.ts), after a secret and a grant read; usually well
+      // under a second.
+      timeout: cdk.Duration.seconds(45),
+      memorySize: 256,
+      description: 'Resolves a review run\'s own fixed review threads, on the pull request its grant names.',
+      logGroup: new logs.LogGroup(this, 'ThreadResolverFnLogs', { retention: logs.RetentionDays.ONE_MONTH }),
+      environment: {
+        GITHUB_SECRET_ARN: props.githubAppSecret.secretArn,
+        IDEMPOTENCY_TABLE: idempotency.tableName,
+      },
+      projectRoot: webhookRoot,
+      depsLockFilePath: depsLock,
+      bundling,
+    });
+    props.githubAppSecret.grantRead(threadResolver);
+    threadResolver.addToRolePolicy(new iam.PolicyStatement({
+      sid: 'ResolveGrants',
+      actions: ['dynamodb:GetItem'],
+      resources: [idempotency.tableArn],
+      conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['resolve#*'] } },
+    }));
+    // A resource policy, so the reviewer stacks need nothing from this one.
+    for (const [reviewerId, role] of props.reviewerRoles) {
+      threadResolver.addPermission(`InvokeBy${routeConstructId(reviewerId)}`, {
+        principal: new iam.ArnPrincipal(role.roleArn),
+        action: 'lambda:InvokeFunction',
+      });
+    }
+
     const queueUrls = new Map<string, string>();
     const queueArns: string[] = [];
     for (const route of props.routes) {
@@ -188,6 +229,7 @@ export class WebhookStack extends cdk.Stack {
         RUNTIME_ARN: route.runtimeArn,
         HEARTBEAT_TABLE: props.heartbeatTable.tableName,
         IDEMPOTENCY_TABLE: idempotency.tableName,
+        THREAD_RESOLVER_FUNCTION: threadResolver.functionName,
       });
       // Heartbeat reads on redelivery and the pull request's running
       // reviews (GetItem, Scan), and the run's start record, which the
@@ -206,6 +248,15 @@ export class WebhookStack extends cdk.Stack {
         actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'],
         resources: [idempotency.tableArn],
         conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*'] } },
+      }));
+      // A run's resolve grant (resolve#<hash>, src/resolve-grant.ts): the
+      // worker writes it just before the invoke, and writes nothing else
+      // with this grant.
+      worker.addToRolePolicy(new iam.PolicyStatement({
+        sid: 'ResolveGrants',
+        actions: ['dynamodb:PutItem'],
+        resources: [idempotency.tableArn],
+        conditions: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['resolve#*'] } },
       }));
       worker.addEventSource(new lambdaEventSources.SqsEventSource(queue, {
         batchSize: 1,
@@ -313,5 +364,6 @@ export class WebhookStack extends cdk.Stack {
       description: 'Webhook URL for the GitHub App settings.',
     });
     new cdk.CfnOutput(this, 'IdempotencyTableName', { value: idempotency.tableName });
+    new cdk.CfnOutput(this, 'ThreadResolverFunctionName', { value: threadResolver.functionName });
   }
 }

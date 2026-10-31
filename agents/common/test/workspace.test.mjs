@@ -231,3 +231,16 @@ test('the previous state is carried over by the same rule the reviewer prompts g
   // resolved means fixed at the head; a wrong finding is dropped instead.
   assert.ok(overview.includes('Carry every finding forward into this run\'s `state`, marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.'));
 });
+
+test('an inline comment is listed at the line it was posted at, then where that line is now', () => {
+  const comment = (path, line, originalLine) => ({ user: 'valkey-review-bot[bot]', path, line, originalLine, body: 'Leak.', createdAt: '2026-10-01T00:00:00Z' });
+  const overview = renderPrOverview({
+    ...baseCtx,
+    existingReviewComments: [comment('src/a.c', 10, 10), comment('src/b.c', 42, 30), comment('src/c.c', null, 7), comment('src/d.c', 5, null)],
+  });
+  const listed = block(overview, 'inline review comments');
+  assert.match(listed, /on src\/a\.c:10: Leak\./);
+  assert.match(listed, /on src\/b\.c:30 \(now line 42\): Leak\./);
+  assert.match(listed, /on src\/c\.c:7: Leak\./);
+  assert.match(listed, /on src\/d\.c:5: Leak\./);
+});

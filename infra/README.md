@@ -12,7 +12,7 @@ secret names.
 | `ValkeyReviewerSubstrate` | KMS key, prompt and skill bucket, reference to the GitHub App secret, one token broker Lambda per reviewer, the skills-repo token broker Lambda when `skillsRepo` is set, run heartbeat table |
 | `ValkeyReviewAgent`, `ValkeyGlideReviewAgent` | One reviewer each: AgentCore runtime, its execution role, its concerns table, prompt and skill upload |
 | `ValkeyReviewerCurator` | Curator runtime and its execution role, and the upload of `prompt.md`, `skill.md` and `skill-check.md` under `curator/` |
-| `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, one queue and worker per route, the curator queue and worker, dead-letter queues |
+| `ValkeyReviewWebhook` | HTTP API, receiver Lambda, idempotency table, thread resolver Lambda, one queue and worker per route, the curator queue and worker, dead-letter queues |
 | `ValkeyReviewerDecay` | Daily Lambda that decays concerns and queues skill checks and retirements on the curator queue |
 
 Each runtime has its own role:
@@ -25,7 +25,8 @@ Each runtime has its own role:
     concerns tables, but the role has no DynamoDB access to them;
   - read its own skills registry;
   - get, put and update any item in the shared heartbeat table;
-  - invoke its own token broker;
+  - invoke its own token broker, and the thread resolver, which resolves
+    the App's threads only on the pull request the run's grant names;
   - write its own runtime log groups
     (`/aws/bedrock-agentcore/runtimes/<runtime name>-*`, for example
     `valkey_review_runtime-*`);
@@ -58,10 +59,14 @@ Other functions:
   (`sqs:SendMessage`, `sqs:GetQueueAttributes` and `sqs:GetQueueUrl`, on
   that queue only). It reads the GitHub releases API without credentials.
 - Each review worker can invoke its route's runtime, read the heartbeat
-  table and update its items (the run's start record), and get, update
-  and delete the receiver's `pending#` items in the idempotency table
-  (the grant is limited to that key prefix). The curator worker can only
-  invoke the curator runtime.
+  table and update its items (the run's start record), get, update
+  and delete the receiver's `pending#` items in the idempotency table,
+  and put `resolve#` items there, each run's resolve grant (the grants
+  are limited to those key prefixes). The curator worker can only invoke
+  the curator runtime.
+- The thread resolver can read the GitHub App secret and get `resolve#`
+  items in the idempotency table. Its resource policy lets only the
+  reviewer runtime roles invoke it.
 - The skills-repo broker can read only its App secret
   (`secretsmanager:GetSecretValue` on that secret). Only the curator role
   may invoke it.
@@ -85,15 +90,21 @@ permissions are granted only when an `openai.*` model is configured.
    `npx cdk bootstrap aws://ACCOUNT/REGION`. If you use a custom qualifier,
    pass `--qualifier` and set `aws.bootstrapQualifier` to the same value.
 3. Create a GitHub App. Give it at least Pull requests (read and write),
-   Issues (read) and Metadata (read). The token broker requests only Pull
-   requests and Metadata; Issues (read) is what lets the App subscribe to
-   `issue_comment`. Subscribe it to the `pull_request`,
+   Issues (read) and Metadata (read). The tokens the reviewer runtimes get
+   carry only Pull requests and Metadata; Issues (read) is what lets the App
+   subscribe to `issue_comment`. Subscribe it to the `pull_request`,
    `pull_request_review`, `pull_request_review_comment` and
    `issue_comment` events, and install it on the repositories you route.
-   Reviews need no Contents permission. The pull requests that propose
-   edits to the reviewers' skill files need an App with Contents on the
-   bot's repository: this App by default, or a dedicated one; see
-   [The skills-repo App](#the-skills-repo-app).
+   Reviews need no Contents permission. Two things do. The bot resolves
+   its own review threads once their findings are fixed, and GitHub lets
+   only a token with Contents write resolve a thread: the thread resolver
+   mints that token for it and never hands it out. With Contents (read and
+   write), the App's key can mint `contents: write` tokens for every
+   repository the App is installed on; [SECURITY.md](../SECURITY.md) weighs
+   that. Without it, those threads stay open and reviews work as before.
+   The pull requests that propose edits to the reviewers' skill files need
+   an App with Contents on the bot's repository: this App by default, or a
+   dedicated one; see [The skills-repo App](#the-skills-repo-app).
 4. Store the App credentials in Secrets Manager, in the target account and
    region, under the name you set in `github.appSecretName`. The secret is a
    JSON object:
@@ -642,19 +653,21 @@ of its own, installed only on the bot repository:
 
 The broker asks GitHub for a token limited to that one repository, with
 `contents: write`, `pull_requests: write` and `metadata: read`, whatever
-else the App may do. Without `appSecretName` the main App is used, which
-works but widens what the main App holds. It needs Contents (read and
-write), and each account it is installed on, such as `valkey-io` for
-`valkey-io/valkey`, must approve that new permission. Its private key,
-which the receiver and the reviewer brokers can read, could then mint
-`contents: write` tokens for every repository the App is installed on.
+else the App may do. Without `appSecretName` the main App is used. It then
+needs Contents (read and write), as thread resolution does: each account it
+is installed on, such as `valkey-io` for `valkey-io/valkey`, must approve
+that permission, and its private key, which the receiver and the reviewer
+brokers can read, can mint `contents: write` tokens for every repository
+the App is installed on.
 
-The receiver and the reviewer brokers ask for explicit permissions without
-Contents either way: the receiver for `pull_requests: write`,
-`issues: read` and `metadata: read` (`RECEIVER_TOKEN_PERMISSIONS` in
-`webhook/src/github.ts`), and the reviewer brokers for
-`pull_requests: write` and `metadata: read`. So their tokens, and the
-reviewer runtimes, never get Contents permission.
+The receiver and the tokens the reviewer brokers hand out ask for explicit
+permissions without Contents either way: the receiver for
+`pull_requests: write`, `issues: read` and `metadata: read`
+(`RECEIVER_TOKEN_PERMISSIONS` in `webhook/src/github.ts`), and the reviewer
+runtimes' tokens for `pull_requests: write` and `metadata: read`. So the
+reviewer runtimes never get Contents permission. The token with Contents
+the thread resolver mints, to resolve the bot's review threads, stays inside
+the resolver.
 
 The commits are made with the broker's token, so GitHub authors them as
 the App's bot user. Their `Signed-off-by` line is `skillsRepo.signOff`, or

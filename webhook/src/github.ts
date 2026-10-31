@@ -197,6 +197,15 @@ export function githubApi(token: string, fetchImpl: typeof fetch = fetch): GitHu
   };
 }
 
+/** The App's slug, which GraphQL gives as the login of its bot. `api` is authenticated as the App. */
+export async function fetchAppSlug(api: GitHubApi): Promise<string> {
+  const { status, json } = await api('GET', 'app');
+  if (status !== 200) throw new Error(`GET app returned ${status}`);
+  const slug = (json as { slug?: unknown }).slug;
+  if (typeof slug !== 'string' || !slug) throw new Error('GET app returned no slug');
+  return slug;
+}
+
 /**
  * The App's installation on one repository: its id and the login of the
  * account it belongs to. `api` must be authenticated as the App (JWT).
@@ -217,7 +226,10 @@ export interface ReviewComment {
   readonly body: string;
   readonly author?: string;
   readonly path?: string;
+  /** The line the comment is on at the head, or the line it was posted on when GitHub no longer places it. */
   readonly line?: number;
+  /** The line it was posted on; the last one of a multi-line comment. */
+  readonly originalLine?: number;
 }
 
 /** One pull request review comment, or undefined when GitHub does not return it. */
@@ -231,5 +243,6 @@ export async function fetchReviewComment(api: GitHubApi, repo: string, commentId
     ...(c.user?.login ? { author: c.user.login } : {}),
     ...(c.path ? { path: c.path } : {}),
     ...(typeof line === 'number' ? { line } : {}),
+    ...(typeof c.original_line === 'number' ? { originalLine: c.original_line } : {}),
   };
 }

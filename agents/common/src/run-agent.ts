@@ -5,13 +5,14 @@ import type { Octokit } from '@octokit/rest';
 
 import { loadEnv, loadAssets, type AgentEnv } from './config.js';
 import { createOctokit, createTokenSource, type TokenSource } from './github-auth.js';
+import { createThreadResolver, type ThreadResolver } from './thread-resolver.js';
 import { createHeartbeat } from './heartbeat.js';
 import { prepareWorkspace, renderPrOverview, type PrContext } from './workspace.js';
 import { labelSuppressedPieces, loadGraduatedSkills, renderGraduatedSkills } from './graduated-skills.js';
 import { createStatusComment, type StatusComment } from './status-comment.js';
 import { ModelCallLimit, ReviewConversationManager, StreamStallRetryStrategy, textDelta } from './agent-loop.js';
 import { createConverseModel, createMantleModel, isMantleModel } from './models.js';
-import { isTerminalCallbackWired, type TerminalToolName } from './tools/gh.js';
+import { isTerminalCallbackWired, isThreadResolverWired, type TerminalToolName } from './tools/gh.js';
 
 /**
  * Shared bedrock-agentcore entrypoint + Strands loop.
@@ -42,6 +43,11 @@ export interface AssembleBaseOpts {
   readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
   /** Pass this to assembleCommonTools too: true once the model call limit stopped the review. */
   readonly callLimitReached?: () => boolean;
+  /**
+   * Pass this to assembleCommonTools too: it resolves the run's own fixed
+   * threads. Absent when the queue worker gave the run no grant.
+   */
+  readonly threadResolver?: ThreadResolver;
 }
 
 export type AssembleTools = (opts: AssembleBaseOpts) => Promise<readonly unknown[]>;
@@ -75,6 +81,9 @@ export const requestSchema = z.object({
   // new trigger does not fail the run.
   trigger: z.string().optional(),
   skip_drafts: z.boolean().optional(),
+  // The queue worker's grant for resolving this run's own threads, and
+  // the resolver to present it to (webhook/src/invoker.ts).
+  thread_resolver: z.object({ function_name: z.string().min(1), grant: z.string().min(16).max(200) }).optional(),
 });
 
 export type Payload = z.infer<typeof requestSchema>;
@@ -90,6 +99,7 @@ export interface RunDeps {
   readonly createModel: (env: AgentEnv, modelId: string) => Model;
   readonly createHeartbeat: typeof createHeartbeat;
   readonly createTokenSource: typeof createTokenSource;
+  readonly createThreadResolver: typeof createThreadResolver;
   readonly createOctokit: typeof createOctokit;
   readonly prepareWorkspace: typeof prepareWorkspace;
   readonly loadGraduatedSkills: typeof loadGraduatedSkills;
@@ -106,6 +116,7 @@ const DEFAULT_DEPS: RunDeps = {
   createModel,
   createHeartbeat,
   createTokenSource,
+  createThreadResolver,
   createOctokit,
   prepareWorkspace,
   loadGraduatedSkills,
@@ -237,6 +248,10 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
       });
       await tokens.get(); // fail fast if the broker refuses this repo
       const octokit = deps.createOctokit(tokens);
+      const resolver = payload.thread_resolver;
+      const threadResolver = resolver
+        ? deps.createThreadResolver({ functionName: resolver.function_name, grant: resolver.grant, region: env.region })
+        : undefined;
 
       // Mention-triggered run: take over the receiver's ack comment.
       // The opener (or fallback notice) goes up before the slow
@@ -310,9 +325,13 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
         statusComment,
         onTerminal,
         callLimitReached: () => limitReached,
+        ...(threadResolver ? { threadResolver } : {}),
       });
       if (!isTerminalCallbackWired(onTerminal)) {
         throw new Error('assembleTools did not pass onTerminal to assembleCommonTools, so the run could not tell when the review is done');
+      }
+      if (threadResolver && !isThreadResolverWired(threadResolver)) {
+        console.warn('[tools] assembleTools did not pass threadResolver to assembleCommonTools, so threads of fixed findings stay open');
       }
 
       yield { event: 'status', data: { phase: 'review', pr: `${ctx.owner}/${ctx.repo}#${ctx.prNumber}` } };

@@ -16,6 +16,7 @@ export async function assembleTools(opts: AssembleBaseOpts): Promise<readonly un
     statusComment: opts.statusComment,
     onTerminal: opts.onTerminal,
     callLimitReached: opts.callLimitReached,
+    threadResolver: opts.threadResolver,
   });
 
   const extras: unknown[] = [];

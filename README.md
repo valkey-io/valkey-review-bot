@@ -16,7 +16,9 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 - **A review state comment**, one per pull request, rewritten on every review:
   - whether the change is ready for a human reviewer, or what still blocks it;
   - the risk of merging it, and why;
-  - open and resolved findings, carried over between reviews;
+  - open and resolved findings, carried over between reviews. When a review finds one
+    of its own inline comments fixed, it resolves that comment's thread, unless someone
+    other than the pull request's author replied in it;
   - whether the fix needs a backport, and to which maintained release lines;
   - a different approach, only when the reviewer checked one against the code and found
     it clearly better.

@@ -4,8 +4,9 @@ import type { Octokit } from '@octokit/rest';
 import type { PrContext } from '../workspace.js';
 import type { StatusComment } from '../status-comment.js';
 import type { TokenSource } from '../github-auth.js';
+import type { ThreadResolver } from '../thread-resolver.js';
 import {
-  previousFullReview, reviewStateSchema, renderReviewState, stripStateMarker, validateReviewState,
+  locationKey, openFindingKeys, previousFullReview, reviewStateSchema, renderReviewState, stripStateMarker, validateReviewState,
   type ReviewHeads, type ReviewState, type StateCommentWriter,
 } from '../review-state.js';
 import { runBounded } from './spawn.js';
@@ -96,6 +97,15 @@ export function isTerminalCallbackWired(onTerminal: object): boolean {
   return wiredCallbacks.has(onTerminal);
 }
 
+// Thread resolvers some post_review got. run-agent checks for the run's,
+// so an agent that drops it is noticed instead of leaving fixed threads
+// open without a word.
+const wiredResolvers = new WeakSet<object>();
+
+export function isThreadResolverWired(threadResolver: object): boolean {
+  return wiredResolvers.has(threadResolver);
+}
+
 export function createTerminalGate(onTerminal?: (tool: TerminalToolName, result: string) => void): TerminalGate {
   if (onTerminal) wiredCallbacks.add(onTerminal);
   let state: 'open' | 'busy' | TerminalToolName = 'open';
@@ -142,6 +152,11 @@ export interface GhToolsDeps {
    * partial review.
    */
   readonly callLimitReached?: () => boolean;
+  /**
+   * Resolves the run's own fixed threads, with the grant the queue worker
+   * gave the run. Without it, threads stay open.
+   */
+  readonly threadResolver?: ThreadResolver;
 }
 
 /** Repositories gh_api_read may read: the PR's and the upstream the release branches come from. */
@@ -180,15 +195,221 @@ async function writeState(
   deps: GhToolsDeps,
   state: ReviewState,
   heads: ReviewHeads,
-): Promise<{ url: string | null; error: string | null }> {
+): Promise<{ url: string | null; error: string | null; userId: number | null }> {
   try {
-    const { url } = await deps.stateWriter.write(renderReviewState(state, heads));
-    return { url, error: null };
+    const { url, userId } = await deps.stateWriter.write(renderReviewState(state, heads));
+    return { url, error: null, userId };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn(`[review-state] write failed: ${msg}`);
-    return { url: null, error: msg };
+    return { url: null, error: msg, userId: null };
   }
+}
+
+const REVIEW_THREADS_QUERY = `query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          path
+          line
+          originalLine
+          originalStartLine
+          comments(first: 100) { totalCount nodes { author { __typename login ... on Bot { databaseId } } pullRequestReview { databaseId } } }
+        }
+      }
+    }
+  }
+}`;
+
+/** At most this many pages of 100 review threads are read. */
+const MAX_THREAD_PAGES = 10;
+
+/** Thread ids sent to the thread resolver per call; see webhook/src/resolver.ts. */
+const THREADS_PER_RESOLVE_CALL = 50;
+
+/**
+ * A review thread. `line` is where GitHub places it at the head, null
+ * when it no longer can. GraphQL's startLine is left out: it keeps the
+ * line the comment started on when the thread moves.
+ */
+interface ReviewThreadNode {
+  readonly id: string;
+  readonly isResolved: boolean;
+  readonly path: string;
+  readonly line: number | null;
+  readonly originalLine: number | null;
+  readonly originalStartLine: number | null;
+  readonly comments: {
+    readonly totalCount: number;
+    readonly nodes: readonly {
+      readonly author: { readonly __typename?: string; readonly login?: string; readonly databaseId?: number } | null;
+      readonly pullRequestReview: { readonly databaseId: number | null } | null;
+    }[];
+  };
+}
+
+/**
+ * True when the read returned every comment of the thread and each is
+ * the App's or the pull request author's: the thread resolver refuses
+ * any other (webhook/src/resolver.ts), so a person's reply stays in view.
+ */
+function onlyAppAndAuthor(t: ReviewThreadNode, botUserId: number, prAuthor: string): boolean {
+  return t.comments.totalCount === t.comments.nodes.length && t.comments.nodes.every((c) => c.author?.databaseId === botUserId
+    || (c.author?.__typename === 'User' && !!prAuthor && c.author.login?.toLowerCase() === prAuthor.toLowerCase()));
+}
+
+
+/** A finding's location: its `path:line` key, split. */
+interface FindingLine {
+  readonly key: string;
+  readonly path: string;
+  readonly line: number;
+}
+
+function findingLines(keys: Iterable<string>): FindingLine[] {
+  return [...keys].map((key) => {
+    const i = key.lastIndexOf(':');
+    return { key, path: key.slice(0, i), line: Number(key.slice(i + 1)) };
+  });
+}
+
+/** `path:line` keys of the findings that are, or are not, resolved. Findings without a line are left out. */
+function findingKeys(state: ReviewState, resolved: boolean): Set<string> {
+  const keys = new Set<string>();
+  for (const f of state.findings) {
+    if (f.resolved !== resolved) continue;
+    const key = locationKey(f.location);
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+interface FindingSets {
+  /** Keys open in the previous state. */
+  readonly wasOpen: ReadonlySet<string>;
+  readonly open: readonly FindingLine[];
+  readonly resolved: ReadonlySet<string>;
+  /** Every finding in this state, open or resolved, and their keys. */
+  readonly named: readonly FindingLine[];
+  readonly namedKeys: ReadonlySet<string>;
+}
+
+/** `path:line` of the last line a thread was posted on, which a finding's location names. */
+function postedKey(t: ReviewThreadNode): string | null {
+  return t.originalLine === null ? null : `${t.path}:${t.originalLine}`;
+}
+
+/**
+ * Whether this run fixed the finding a thread is about. `taken` holds the
+ * posted keys of all this App's threads on the PR: a line another thread
+ * was posted on is that thread's. The thread is named by a finding on
+ * the line it was posted on; failing that, by the one finding on the
+ * other lines it was posted on (start line to line); failing that, by a
+ * finding on the line it is on now. An open finding on any of those
+ * leaves it alone. It qualifies when the finding naming it is resolved
+ * now and was open before. A finding the previous state had open on the
+ * posted line, and that this state names only on the line it is on now,
+ * moved and counts too.
+ */
+function threadFixed(t: ReviewThreadNode, sets: FindingSets, taken: ReadonlySet<string>): boolean {
+  const posted = postedKey(t);
+  const now = t.line === null ? null : `${t.path}:${t.line}`;
+  const own = (key: string) => key === posted || !taken.has(key);
+  const from = t.originalStartLine ?? t.originalLine;
+  const inPosted = (f: FindingLine) => posted !== null && from !== null && f.path === t.path
+    && f.line >= from && f.line <= t.originalLine! && own(f.key);
+  if (sets.open.some((f) => inPosted(f) || (f.key === now && own(f.key)))) return false;
+  let key: string | null = null;
+  if (posted !== null && sets.namedKeys.has(posted)) {
+    key = posted;
+  } else {
+    const inside = [...new Set(sets.named.filter(inPosted).map((f) => f.key))];
+    // Two findings on its lines, neither on the last: which one it is about is unclear.
+    if (inside.length > 1) return false;
+    key = inside[0] ?? (now !== null && sets.namedKeys.has(now) && own(now) ? now : null);
+  }
+  if (key === null || !sets.resolved.has(key)) return false;
+  if (sets.wasOpen.has(key)) return true;
+  return key === now && posted !== null && sets.wasOpen.has(posted) && !sets.namedKeys.has(posted);
+}
+
+/**
+ * Resolves this App's open review threads whose finding this run fixed:
+ * open in the previous state comment, resolved in this one (threadFixed).
+ * A finding's `location` is the `path:line` its inline comment was posted
+ * at. A thread that an open finding also names is left alone, and so are
+ * a thread someone else started, a thread anyone but the App and the pull
+ * request's author commented in, and the threads of `ownReviewId`, the
+ * review this call posted.
+ * A finding fixed in an earlier run is not looked at again, so a thread a
+ * person reopened stays open. Threads are never reopened: a person who
+ * resolves one has answered it.
+ *
+ * GitHub lets only a token with contents: write resolve a thread, which
+ * the run's token is not, so the thread resolver resolves them, for the
+ * pull request the run's grant names. Returns how many it resolved.
+ * Errors are logged, never thrown: the review is complete either way. A failed resolve is not tried again: the next run
+ * does not see the finding open, so the thread stays open.
+ */
+async function resolveFixedThreads(
+  deps: GhToolsDeps,
+  state: ReviewState,
+  botUserId: number | null,
+  ownReviewId: number | null,
+): Promise<number> {
+  const { ctx, octokit, threadResolver } = deps;
+  if (!ctx.previousState || botUserId === null) return 0;
+  const openKeys = findingKeys(state, false);
+  const resolvedKeys = findingKeys(state, true);
+  const namedKeys = new Set([...openKeys, ...resolvedKeys]);
+  const wasOpen = openFindingKeys(ctx.previousState.body);
+  // A thread qualifies only through a key open before that is resolved now, or one this state dropped.
+  if (![...wasOpen].some((k) => resolvedKeys.has(k) || !namedKeys.has(k))) return 0;
+  if (!threadResolver) {
+    console.warn('[review-threads] this run has no resolve grant, so threads of fixed findings stay open');
+    return 0;
+  }
+  const sets: FindingSets = {
+    wasOpen,
+    open: findingLines(openKeys),
+    resolved: resolvedKeys,
+    named: findingLines(namedKeys),
+    namedKeys,
+  };
+  const ids: string[] = [];
+  let resolved = 0;
+  try {
+    const threads: ReviewThreadNode[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_THREAD_PAGES; page++) {
+      const data: {
+        repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: boolean; endCursor: string | null }; nodes: ReviewThreadNode[] } } | null };
+      } = await octokit.graphql(REVIEW_THREADS_QUERY, { owner: ctx.owner, repo: ctx.repo, number: ctx.prNumber, cursor });
+      const pageThreads = data.repository.pullRequest?.reviewThreads;
+      if (!pageThreads) break;
+      threads.push(...pageThreads.nodes);
+      if (!pageThreads.pageInfo.hasNextPage) break;
+      cursor = pageThreads.pageInfo.endCursor;
+    }
+    const ours = threads.filter((t) => t.comments.nodes[0]?.author?.databaseId === botUserId);
+    const taken = new Set(ours.map(postedKey).filter((k) => k !== null));
+    for (const t of ours) {
+      if (t.isResolved || (ownReviewId !== null && t.comments.nodes[0]?.pullRequestReview?.databaseId === ownReviewId)) continue;
+      if (onlyAppAndAuthor(t, botUserId, ctx.author) && threadFixed(t, sets, taken)) ids.push(t.id);
+    }
+    for (let i = 0; i < ids.length; i += THREADS_PER_RESOLVE_CALL) {
+      resolved += (await threadResolver.resolve(ids.slice(i, i + THREADS_PER_RESOLVE_CALL))).length;
+    }
+    if (resolved < ids.length) console.warn(`[review-threads] the thread resolver resolved ${resolved} of ${ids.length} thread(s); see its log`);
+  } catch (err) {
+    console.warn(`[review-threads] resolving fixed threads failed after ${resolved} of ${ids.length}: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (resolved > 0) console.log(`[review-threads] resolved ${resolved} thread(s) whose finding is fixed`);
+  return resolved;
 }
 
 /** Result field for a failed state write, telling the model the review is still done. */
@@ -202,6 +423,14 @@ const NOTHING_NEW = 'Review complete. Nothing new met the bar for an inline comm
 const fullReviewSchema = z.boolean().optional().describe(
   'On a mention-triggered run, true only if this run reviewed the whole PR at the current head, not just the area or the thread the request named. On an automatic review, false if you did not finish reviewing the whole PR. Leave it unset otherwise.',
 );
+
+/** Writes the state, then resolves the threads of findings it marks fixed, except those of `ownReviewId`. */
+async function finishState(deps: GhToolsDeps, state: ReviewState, heads: ReviewHeads, ownReviewId: number | null = null) {
+  const written = await writeState(deps, state, heads);
+  // A state that did not reach GitHub does not show the finding fixed, so its thread stays open too.
+  const threadsResolved = written.error === null ? await resolveFixedThreads(deps, state, written.userId, ownReviewId) : 0;
+  return { ...written, threadsResolved };
+}
 
 /** A review comment's text, for comparing what was posted with what was sent. */
 function sameText(a: string | null | undefined, b: string): boolean {
@@ -250,6 +479,10 @@ async function findOwnReview(
     if (sameComments(posted, comments)) return { id: r.id, url: r.html_url };
   }
   return null;
+}
+
+function threadsResult(count: number): { threads_resolved?: number } {
+  return count > 0 ? { threads_resolved: count } : {};
 }
 
 function withStateLink(text: string, stateUrl: string | null): string {
@@ -302,6 +535,7 @@ Do NOT include a leading slash. Append query strings inline, e.g. \`repos/OWNER/
  */
 export function buildPostReviewTool(deps: GhToolsDeps) {
   const gate = deps.terminalGate ?? createTerminalGate();
+  if (deps.threadResolver) wiredResolvers.add(deps.threadResolver);
   // When a submission may have made the review without saying so, the
   // time it started. The next call looks for that review before it posts.
   let unanswered: string | null = null;
@@ -313,7 +547,7 @@ export function buildPostReviewTool(deps: GhToolsDeps) {
 Supply:
 - \`body\`: on a mention-triggered run, the short reply to the requester. Otherwise leave it empty; the summary lives in \`state\`.
 - \`comments\`: an array of inline comments. Each item: { path, line, side?, body }. \`line\` is 1-indexed in the RIGHT file (side: "RIGHT" default). Use \`start_line\` + \`line\` for multi-line comments. Anchor only to lines present in the PR diff.
-- \`state\`: the full current review state. The runtime renders it into the PR's single review-state comment and rewrites that comment on every run.
+- \`state\`: the full current review state. The runtime renders it into the PR's single review-state comment and rewrites that comment on every run. It then resolves each of your open threads whose finding was open in the previous state and \`state\` marks resolved.
 - \`full_review\`: on a mention-triggered run, true only if you reviewed the whole PR at this head. On an automatic review, false if you did not finish it.
 
 \`body\` and each comment body may be at most ${MAX_GITHUB_TEXT_CHARS} characters.
@@ -394,7 +628,7 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
       unanswered = null;
 
       // A failed state write is only reported; see writeState.
-      const state = await writeState(deps, input.state, heads);
+      const state = await finishState(deps, input.state, heads, review?.id ?? null);
       if (deps.statusComment) {
         const reply = stripStateMarker(input.body).trim()
           || (input.comments.length > 0 ? `Review complete. See the ${input.comments.length} inline comment(s).` : NOTHING_NEW);
@@ -405,6 +639,7 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
         review_id: review?.id ?? null,
         url: review?.url ?? null,
         state_comment_url: state.url,
+        ...threadsResult(state.threadsResolved),
         ...stateError(state.error),
       });
       gate.complete('post_review', result);
@@ -424,7 +659,7 @@ export function buildSkipTool(deps: GhToolsDeps) {
     description:
 `End the review without inline comments. Call this when nothing in this run warrants an inline comment. Do NOT use this as cover for missing findings. After a successful post_review or skip_review, later calls return an error and post nothing.
 
-Posts no review, but still writes \`state\` to the PR's review-state comment, so the PR shows the current verdict (for example "ready for human review", or open findings carried over from an earlier run).`,
+Posts no review, but still writes \`state\` to the PR's review-state comment, so the PR shows the current verdict (for example "ready for human review", or open findings carried over from an earlier run). It then resolves each of your open threads whose finding was open in the previous state and \`state\` marks resolved.`,
     inputSchema: z.object({
       reason: z.string().min(1).describe('One-sentence rationale. Logged, and on a mention-triggered run shown to the requester.'),
       state: reviewStateSchema,
@@ -437,7 +672,7 @@ Posts no review, but still writes \`state\` to the PR's review-state comment, so
       const taken = gate.acquire('skip_review');
       if (taken) return taken;
       // A failed state write is only reported; see writeState.
-      const state = await writeState(deps, input.state, heads);
+      const state = await finishState(deps, input.state, heads);
       // Mention-triggered runs: someone asked and is watching the status
       // comment, and a silent exit would leave it on "still working".
       if (deps.statusComment) {
@@ -449,6 +684,7 @@ Posts no review, but still writes \`state\` to the PR's review-state comment, so
         reason: input.reason,
         pr: `${deps.ctx.owner}/${deps.ctx.repo}#${deps.ctx.prNumber}`,
         state_comment_url: state.url,
+        ...threadsResult(state.threadsResolved),
         ...stateError(state.error),
       });
       gate.complete('skip_review', result);

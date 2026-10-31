@@ -1,7 +1,9 @@
+import { randomBytes } from 'node:crypto';
 import { BedrockAgentCoreClient, InvokeAgentRuntimeCommand } from '@aws-sdk/client-bedrock-agentcore';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, GetCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, GetCommand, PutCommand, ScanCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { loadInvokerConfig } from './config.js';
+import { grantItem, grantKey } from './resolve-grant.js';
 import { heartbeatRunKey, pendingMarkerOf, type PendingMarker } from './review-envelope.js';
 import { clearPendingReview, extendPendingReview, holdsPendingReview } from './store.js';
 import {
@@ -16,12 +18,13 @@ import {
 } from './watchdog.js';
 
 /**
- * Queue worker: one message per invocation, forwarded unchanged to the
- * route's AgentCore runtime (a reviewer or the curator). The receiver
- * shaped each envelope for its runtime, so this code stays agnostic of
- * the payload. src/watchdog.ts decides whether a message runs at all.
+ * Queue worker: one message per invocation, forwarded to the route's
+ * AgentCore runtime (a reviewer or the curator). The receiver shaped each
+ * envelope for its runtime, so this code stays agnostic of the payload,
+ * apart from adding a review's resolve grant. src/watchdog.ts decides whether a message runs at all.
  * Just before it runs a review, it writes the run's start record in the
- * heartbeat table, then removes an automatic review's pending marker.
+ * heartbeat table, then removes an automatic review's pending marker, and
+ * writes the run's resolve grant.
  */
 
 const config = loadInvokerConfig(process.env);
@@ -166,6 +169,46 @@ async function clearMarkerForRun(marker: PendingMarker, tag: string): Promise<bo
   return cleared;
 }
 
+/**
+ * How long a run's resolve grant stays valid: as long as the session the
+ * run is in can live (SESSION_MAX_LIFETIME_SECONDS in
+ * infra/lib/valkey-review-agent-stack.ts).
+ */
+const RESOLVE_GRANT_SECONDS = 2 * 60 * 60;
+
+/**
+ * Writes the run's resolve grant (src/resolve-grant.ts) and returns what
+ * the run presents to the thread resolver: the resolver's name and a
+ * random value only this run is given. The grant names the envelope's
+ * repository, pull request and installation, so the run can resolve
+ * threads on that pull request alone. Without the resolver configured,
+ * or when the write fails, the run gets none and leaves its threads open.
+ */
+async function resolveGrantFor(envelope: Record<string, unknown>, tag: string): Promise<{ function_name: string; grant: string } | undefined> {
+  if (!config.threadResolverFunction || !config.idempotencyTable) {
+    console.warn(`[resolve] ${tag}: THREAD_RESOLVER_FUNCTION or IDEMPOTENCY_TABLE is not set; the run gets no resolve grant and leaves its threads open`);
+    return undefined;
+  }
+  const { repo, pr_number: prNumber, installation_id: installationId } = envelope;
+  if (typeof repo !== 'string' || typeof prNumber !== 'number' || typeof installationId !== 'number') return undefined;
+  const grant = randomBytes(32).toString('base64url');
+  try {
+    await ddb.send(new PutCommand({
+      TableName: config.idempotencyTable,
+      Item: {
+        key: grantKey(grant),
+        ...grantItem({ repo, prNumber, installationId, expiresAt: Math.floor(Date.now() / 1000) + RESOLVE_GRANT_SECONDS }),
+      },
+      ConditionExpression: 'attribute_not_exists(#k)',
+      ExpressionAttributeNames: { '#k': 'key' },
+    }));
+  } catch (err) {
+    console.error(`[resolve] ${tag} could not write the resolve grant; the run leaves its threads open`, err);
+    return undefined;
+  }
+  return { function_name: config.threadResolverFunction, grant };
+}
+
 /** A review that gave up waiting lets go of its marker, so the next event can queue a review. */
 async function clearMarkerQuietly(marker: PendingMarker, tag: string): Promise<void> {
   try {
@@ -260,7 +303,12 @@ async function handleOne(record: SqsRecord): Promise<void> {
   }
 
   if (decision.warning) console.warn(`[watchdog] ${tag} ${decision.warning}`);
-  const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
+  const resolver = curator ? undefined : await resolveGrantFor(envelope, tag);
+  const payload = {
+    ...envelope,
+    ...(decision.useFallbackModel ? { use_fallback_model: true } : {}),
+    ...(resolver ? { thread_resolver: resolver } : {}),
+  };
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
 
   const resp = await client.send(new InvokeAgentRuntimeCommand({

@@ -102,6 +102,7 @@ export function addValkeyReviewerStacks(
     githubAppSecret: substrate.githubAppSecret,
     github: config.github,
     heartbeatTable: substrate.heartbeatTable,
+    reviewerRoles: new Map(REVIEWER_IDS.map((r) => [r, reviewer(r).role] as const)),
     routes: config.routes.map((route) => ({ ...route, runtimeArn: reviewer(route.reviewer).runtime.attrAgentRuntimeArn })),
     curatorOnlyRoutes: config.curatorOnlyRoutes,
     curatorRuntimeArn: curator.runtime.attrAgentRuntimeArn,
