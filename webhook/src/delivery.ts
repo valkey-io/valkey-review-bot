@@ -12,15 +12,17 @@ import { releaseQuietly, type DeliveryStore } from './store.js';
  *
  *   1. Verify X-Hub-Signature-256 over the raw body. On a mismatch, fetch
  *      the secret again once in case it was rotated.
- *   2. pull_request opened, reopened, ready_for_review or synchronize (new
- *      commits) on a review route: route gates, idempotency key
- *      repo#pr#head_sha (#reopened, #ready or #push appended for a
- *      reopen, ready_for_review and new commits), the pull request's
- *      pending marker, the pull request's cap on automatic reviews, the
- *      route's daily review budget, then the route's queue. The review
- *      holds the marker until its run starts and covers every push,
- *      reopen or ready_for_review that comes before then. A review of new
- *      commits first waits in the queue for pushReviewDelaySeconds.
+ *   2. pull_request opened, reopened, ready_for_review, synchronize (new
+ *      commits) or edited with a new base branch on a review route: route
+ *      gates, idempotency key repo#pr#head_sha (#reopened, #ready or #push
+ *      appended for a reopen, ready_for_review and new commits, and
+ *      #base<updated_at in Unix seconds> for a base change), the pull request's pending
+ *      marker, the pull request's cap on automatic reviews, the route's
+ *      daily review budget, then the route's queue. The review holds the
+ *      marker until its run starts and covers every push, reopen,
+ *      ready_for_review or base change that comes before then. A review of
+ *      new commits or of a base change first waits in the queue for
+ *      pushReviewDelaySeconds.
  *      closed, and converted_to_draft on a skipDrafts route, never
  *      review; while a review waits, they release the key of a reopen,
  *      or ready_for_review, at that head, and give back the waiting
@@ -105,9 +107,19 @@ const LEAVING_ACTIONS: ReadonlyMap<string, AutomaticTrigger> = new Map([
 ]);
 
 /** The idempotency key of an automatic review: repo#pr#head_sha, then the trigger's nonce. */
-function reviewKey(repo: string, prNumber: number, headSha: string, trigger: AutomaticTrigger): string {
-  const nonce = TRIGGER_NONCES.get(trigger);
+function reviewKey(repo: string, prNumber: number, headSha: string, nonce: string | undefined): string {
   return `${repo}#${prNumber}#${headSha}${nonce ? `#${nonce}` : ''}`;
+}
+
+/**
+ * The nonce of a base change's review. A base change does not move the
+ * head, so the head cannot tell two of them apart: two retargets are two
+ * reviews, and a redelivery of one is its duplicate. The edit sets the
+ * pull request's updated_at, which does tell them apart.
+ */
+function baseChangeNonce(updatedAt: string | undefined): string {
+  const ms = Date.parse(updatedAt ?? '');
+  return Number.isFinite(ms) ? `base${Math.floor(ms / 1000)}` : 'base';
 }
 
 const skip = (reason: string): Outcome => ({ status: 200, body: { ok: true, skipped: reason } });
@@ -255,7 +267,7 @@ export function createDeliveryHandler(
     // Other routes neither review on ready_for_review nor skip a draft.
     if (back === 'ready_for_review' && !route.skipDrafts) return outcome;
 
-    const key = reviewKey(repo, prNumber, headSha, back);
+    const key = reviewKey(repo, prNumber, headSha, TRIGGER_NONCES.get(back));
     try {
       if (!(await deps.store.hasPendingReview(repo, prNumber))) return outcome;
       await release(key);
@@ -273,8 +285,12 @@ export function createDeliveryHandler(
     const action = payload.action ?? '';
     const back = LEAVING_ACTIONS.get(action);
     if (back) return pullRequestLeft(payload, target, action, back);
-    // Narrowed further per route below; anything else never reviews.
-    const trigger = REVIEW_TRIGGERS.get(action);
+    // Narrowed further per route below; anything else never reviews. An
+    // edit reviews only when it changed the base branch: the head is the
+    // same, but the diff is not.
+    const trigger = action === 'edited'
+      ? (payload.changes?.base ? 'base_changed' : undefined)
+      : REVIEW_TRIGGERS.get(action);
     if (!trigger) return skip(`action=${action}`);
 
     // Dependency bumps and other automated PRs are not reviewed.
@@ -321,9 +337,12 @@ export function createDeliveryHandler(
     // because the pull request was closed while a review waited. That is
     // also how a skipped review of a reopen or ready_for_review, which
     // holds that trigger's own key, does not drop the next one.
-    const pushed = trigger === 'push';
-    const nonce = TRIGGER_NONCES.get(trigger);
-    const key = reviewKey(repo, prNumber, headSha, trigger);
+    //
+    // A base change waits in the queue like new commits: a retarget often
+    // comes with a rebase, and one review should cover both.
+    const pushed = trigger === 'push' || trigger === 'base_changed';
+    const nonce = trigger === 'base_changed' ? baseChangeNonce(pr?.updated_at) : TRIGGER_NONCES.get(trigger);
+    const key = reviewKey(repo, prNumber, headSha, nonce);
     if (!(await deps.store.claim(key, { action }))) return skip('duplicate');
 
     // What this review has taken so far, given back newest first when it
@@ -356,10 +375,11 @@ export function createDeliveryHandler(
     try {
       // Every automatic review holds the pull request's pending marker
       // from here until the worker starts its run, so at most one waits
-      // at a time. A push, reopen or ready_for_review that comes while one
-      // waits joins it instead of using a round: the runtime reviews the
-      // head as it is when the run starts. A review of new commits also
-      // waits in the queue first, so that a burst of pushes gets one
+      // at a time. A push, reopen, base change or ready_for_review that
+      // comes while one waits joins it instead of using a round: the
+      // runtime reviews the head as it is when the run starts. A review of
+      // new commits or of a new base also waits in the queue first, so
+      // that a burst of pushes, or a retarget and its rebase, gets one
       // review. An event after the waiting review has started queues the
       // next review.
       //

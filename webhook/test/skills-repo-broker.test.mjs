@@ -134,7 +134,9 @@ test('skillsRepoBrokerFromEnv uses the App id and key from the secret', async ()
   } finally {
     console.log = log;
   }
-  assert.deepEqual(auth.created[0], { appId: '4242', privateKey: '-----BEGIN KEY-----' });
+  const { request, ...created } = auth.created[0];
+  assert.deepEqual(created, { appId: '4242', privateKey: '-----BEGIN KEY-----' });
+  assert.equal(typeof request, 'function', 'the token exchange gets a bounded request');
   // The installation is looked up with the App's JWT.
   assert.equal(http.calls[0].init.headers.Authorization, 'Bearer app-jwt');
   assert.deepEqual(auth.requests.slice(0, 2), [

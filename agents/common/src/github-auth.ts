@@ -18,13 +18,35 @@ export interface TokenSource {
 
 const REFRESH_BEFORE_EXPIRY_MS = 5 * 60_000;
 
+/**
+ * Bound on one call to the token broker. The broker's own timeout is 15
+ * seconds (infra/lib/substrate-stack.ts); this covers that and a cold
+ * start. The SDK sets no timeout of its own, and every GitHub request
+ * waits on this call when the token is due.
+ */
+const BROKER_INVOKE_TIMEOUT_MS = 30_000;
+
+/**
+ * Bound on one GitHub request. GitHub ends an API request that takes it
+ * more than 10 seconds, and gh_api_read gives a whole `gh api` call 30;
+ * fetch sets no timeout of its own.
+ */
+export const GITHUB_REQUEST_TIMEOUT_MS = 30_000;
+
 export function createTokenSource(opts: {
   brokerFunction: string;
   region: string;
   installationId: number;
   repo: string;
 }): TokenSource {
-  const lambda = new LambdaClient({ region: opts.region });
+  const lambda = new LambdaClient({
+    region: opts.region,
+    requestHandler: {
+      connectionTimeout: BROKER_INVOKE_TIMEOUT_MS,
+      requestTimeout: BROKER_INVOKE_TIMEOUT_MS,
+      throwOnRequestTimeout: true,
+    },
+  });
   let current: { token: string; expiresAt: number } | null = null;
   let pending: Promise<string> | null = null;
 
@@ -51,9 +73,31 @@ export function createTokenSource(opts: {
   };
 }
 
-/** Octokit that attaches a current token to every request. */
-export function createOctokit(tokens: TokenSource): Octokit {
-  const octokit = new Octokit();
+/** Statuses whose response has no body; a Response built with one throws. */
+const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([204, 205, 304]);
+
+/**
+ * fetch that gives up after `timeoutMs`, as well as on the caller's own
+ * signal. The bound covers the body too: it is read here, so a body cut
+ * off by the bound or by a dropped connection fails the request.
+ * @octokit/request would report a body it could not read as an empty
+ * success, and a paginated listing would then skip that page.
+ */
+export function boundedFetch(timeoutMs: number): typeof fetch {
+  return async (input, init) => {
+    const timeout = AbortSignal.timeout(timeoutMs);
+    const resp = await fetch(input, { ...init, signal: init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
+    const body = resp.body === null || NULL_BODY_STATUSES.has(resp.status) ? null : await resp.arrayBuffer();
+    const buffered = new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+    // Octokit reports the URL, and pagination reads it.
+    Object.defineProperty(buffered, 'url', { value: resp.url });
+    return buffered;
+  };
+}
+
+/** Octokit that attaches a current token to every request and bounds each one. */
+export function createOctokit(tokens: TokenSource, timeoutMs: number = GITHUB_REQUEST_TIMEOUT_MS): Octokit {
+  const octokit = new Octokit({ request: { fetch: boundedFetch(timeoutMs) } });
   octokit.hook.before('request', async (options) => {
     options.headers.authorization = `token ${await tokens.get()}`;
   });

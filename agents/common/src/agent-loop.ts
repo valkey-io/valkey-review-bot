@@ -89,6 +89,7 @@ export const MODEL_CALL_LIMIT_MESSAGE = 'The model call limit for this review wa
  */
 export class ModelCallLimit {
   private calls = 0;
+  private cancels = 0;
   private limit: number;
 
   constructor(limit: number) {
@@ -104,6 +105,15 @@ export class ModelCallLimit {
     return this.calls >= this.limit;
   }
 
+  /**
+   * True once the limit cancelled a model call, so the agent stopped
+   * short. A model that ended its turn on the last allowed call was not
+   * stopped.
+   */
+  get cancelled(): boolean {
+    return this.cancels > 0;
+  }
+
   /** Make sure at least `calls` more model calls are allowed, raising the cap if needed. */
   reserve(calls: number): void {
     this.limit = Math.max(this.limit, this.calls + calls);
@@ -113,6 +123,7 @@ export class ModelCallLimit {
   onBeforeModelCall(event: Pick<BeforeModelCallEvent, 'cancel'>): void {
     if (this.reached) {
       event.cancel = MODEL_CALL_LIMIT_MESSAGE;
+      this.cancels++;
       return;
     }
     this.calls++;

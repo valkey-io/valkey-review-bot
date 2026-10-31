@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, parseAppSecret, RECEIVER_TOKEN_PERMISSIONS } = await import('../src/github.ts');
+import { generateKeyPairSync } from 'node:crypto';
+import { createServer as createHttpServer } from 'node:http';
+import { createServer } from 'node:net';
+import { createAppAuth } from '@octokit/auth-app';
+
+const {
+  boundedRequest, createAppSecretSource, createInstallationTokens, fetchReviewComment, githubApi, parseAppSecret,
+  RECEIVER_TOKEN_PERMISSIONS,
+} = await import('../src/github.ts');
 
 test('parseAppSecret reads the three fields', () => {
   assert.deepEqual(parseAppSecret(JSON.stringify({ webhook_secret: 'w', private_key: 'k', app_id: 123456 })), {
@@ -88,4 +96,84 @@ test('receiver tokens ask for exactly the permissions the receiver uses, never c
   assert.deepEqual(requests[0].permissions, { pull_requests: 'write', issues: 'read', metadata: 'read' });
   assert.equal(requests[0].installationId, 42);
   assert.equal('contents' in RECEIVER_TOKEN_PERMISSIONS, false);
+});
+
+test('githubApi fails a call whose body is cut off instead of reading it as empty', async () => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(new TextEncoder().encode('{"id": 1'));
+      controller.error(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    },
+  });
+  const api = githubApi('tok', async () => new Response(body, { status: 200, headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(api('GET', 'repos/o/r/installation'), (err) => err.name === 'TimeoutError');
+});
+
+/** A TCP server that accepts every connection and never answers. */
+async function blackHole(t) {
+  const sockets = new Set();
+  const server = createServer((socket) => { sockets.add(socket); });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('the App token exchange gives up at the bound instead of holding the delivery', { timeout: 10_000 }, async (t) => {
+  const url = await blackHole(t);
+  const { privateKey } = generateKeyPairSync('rsa', {
+    modulusLength: 2048,
+    privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    publicKeyEncoding: { type: 'spki', format: 'pem' },
+  });
+  const auth = createAppAuth({ appId: 1, privateKey, installationId: 7, request: boundedRequest(200).defaults({ baseUrl: url }) });
+  const started = Date.now();
+  await assert.rejects(auth({ type: 'installation' }), (err) => err.status === 500 && /timeout/i.test(err.message));
+  assert.ok(Date.now() - started < 5_000, `took ${Date.now() - started} ms`);
+});
+
+const testKey = () => generateKeyPairSync('rsa', {
+  modulusLength: 2048,
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+}).privateKey;
+
+/** An HTTP server that answers the token exchange with `respond(res)`. */
+async function tokenServer(t, respond) {
+  const sockets = new Set();
+  const server = createHttpServer((req, res) => respond(res));
+  server.on('connection', (socket) => sockets.add(socket));
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  });
+  return `http://127.0.0.1:${server.address().port}`;
+}
+
+test('a token exchange whose body is cut off fails instead of returning no token', { timeout: 10_000 }, async (t) => {
+  const privateKey = testKey();
+  const partial = (res) => {
+    res.writeHead(201, { 'content-type': 'application/json; charset=utf-8' });
+    res.write('{"token":"ghs_partial');
+  };
+  const stalls = await tokenServer(t, partial);
+  const dropped = await tokenServer(t, (res) => { partial(res); setTimeout(() => res.socket.destroy(), 20); });
+  for (const url of [stalls, dropped]) {
+    const auth = createAppAuth({ appId: 1, privateKey, installationId: 7, request: boundedRequest(300).defaults({ baseUrl: url }) });
+    await assert.rejects(auth({ type: 'installation' }));
+  }
+});
+
+test('a token exchange with a whole body still returns its token', { timeout: 10_000 }, async (t) => {
+  const url = await tokenServer(t, (res) => {
+    res.writeHead(201, { 'content-type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify({ token: 'ghs_whole', expires_at: '2030-01-01T00:00:00Z', permissions: {}, repository_selection: 'all' }));
+  });
+  const auth = createAppAuth({ appId: 1, privateKey: testKey(), installationId: 7, request: boundedRequest(1000).defaults({ baseUrl: url }) });
+  const result = await auth({ type: 'installation' });
+  assert.equal(result.token, 'ghs_whole');
+  assert.equal(result.expiresAt, '2030-01-01T00:00:00Z');
 });

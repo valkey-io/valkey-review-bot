@@ -35,6 +35,30 @@ function isConditionFailure(err: unknown): boolean {
   return (err as { name?: string } | null)?.name === 'ConditionalCheckFailedException';
 }
 
+/**
+ * An attribute of the item a failed condition found, for a call that set
+ * ReturnValuesOnConditionCheckFailure. The document client does not
+ * convert errors, so the value is still typed ({ S }, { N }).
+ *
+ * The SDK retries a call that timed out, and the first attempt may have
+ * been applied. Its retry then fails its own condition, or passes it a
+ * second time. Each conditional write whose retry would give a wrong
+ * answer (a duplicate, a review already waiting, a cap reached, a round
+ * given back twice or not at all) puts an id of the call in the item and
+ * knows its own write by it. The review counters keep only the latest
+ * take: a take of the same counter that lands between an attempt and its
+ * retry still makes the retry count again.
+ */
+function failedItemValue(err: unknown, name: string): unknown {
+  const v = (err as { Item?: Record<string, unknown> } | null)?.Item?.[name];
+  if (v !== null && typeof v === 'object') {
+    const typed = v as { S?: unknown; N?: unknown };
+    if (typeof typed.S === 'string') return typed.S;
+    if (typeof typed.N === 'string') return Number(typed.N);
+  }
+  return v;
+}
+
 export interface DeliveryStore {
   /** Records the key. False when it is already there: the work was already accepted. */
   claim(key: string, attributes?: Readonly<Record<string, string>>): Promise<boolean>;
@@ -198,16 +222,18 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
   const epochSeconds = (): number => Math.floor(now().getTime() / 1000);
   return {
     async claim(key, attributes = {}) {
+      const claimId = randomUUID();
       try {
         await ddb.send(new PutCommand({
           TableName: tableName,
-          Item: { ...attributes, key, ttl: epochSeconds() + DELIVERY_KEY_TTL_SECONDS, receivedAt: now().toISOString() },
+          Item: { ...attributes, key, ttl: epochSeconds() + DELIVERY_KEY_TTL_SECONDS, receivedAt: now().toISOString(), claimId },
           ConditionExpression: 'attribute_not_exists(#k)',
           ExpressionAttributeNames: { '#k': 'key' },
+          ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
         }));
         return true;
       } catch (err) {
-        if (isConditionFailure(err)) return false;
+        if (isConditionFailure(err)) return failedItemValue(err, 'claimId') === claimId;
         throw err;
       }
     },
@@ -220,55 +246,62 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
       // The condition below always admits the first review of the day, so
       // a zero budget is decided here.
       if (dailyBudget <= 0) return false;
+      const takeId = randomUUID();
       try {
         await ddb.send(new UpdateCommand({
           TableName: tableName,
           Key: { key: budgetKey(routeId, now()) },
-          UpdateExpression: 'SET #ttl = :ttl ADD #reviews :one',
-          ConditionExpression: 'attribute_not_exists(#reviews) OR #reviews < :budget',
-          ExpressionAttributeNames: { '#reviews': 'reviews', '#ttl': 'ttl' },
-          ExpressionAttributeValues: { ':one': 1, ':budget': dailyBudget, ':ttl': epochSeconds() + BUDGET_TTL_SECONDS },
+          UpdateExpression: 'SET #ttl = :ttl, #take = :take ADD #reviews :one',
+          ConditionExpression: '(attribute_not_exists(#reviews) OR #reviews < :budget) AND (attribute_not_exists(#take) OR #take <> :take)',
+          ExpressionAttributeNames: { '#reviews': 'reviews', '#ttl': 'ttl', '#take': 'lastTake' },
+          ExpressionAttributeValues: { ':one': 1, ':budget': dailyBudget, ':ttl': epochSeconds() + BUDGET_TTL_SECONDS, ':take': takeId },
+          ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
         }));
         return true;
       } catch (err) {
-        if (isConditionFailure(err)) return false;
+        if (isConditionFailure(err)) return failedItemValue(err, 'lastTake') === takeId;
         throw err;
       }
     },
 
     async takeAutoReview(repo, prNumber, cap) {
       if (cap <= 0) return 0;
+      const takeId = randomUUID();
+      let taken: unknown;
       try {
         const resp = await ddb.send(new UpdateCommand({
           TableName: tableName,
           Key: { key: autoReviewKey(repo, prNumber) },
-          UpdateExpression: 'SET #ttl = :ttl ADD #reviews :one',
-          ConditionExpression: 'attribute_not_exists(#reviews) OR #reviews < :cap',
-          ExpressionAttributeNames: { '#reviews': 'reviews', '#ttl': 'ttl' },
-          ExpressionAttributeValues: { ':one': 1, ':cap': cap, ':ttl': epochSeconds() + AUTO_REVIEW_TTL_SECONDS },
+          UpdateExpression: 'SET #ttl = :ttl, #take = :take ADD #reviews :one',
+          ConditionExpression: '(attribute_not_exists(#reviews) OR #reviews < :cap) AND (attribute_not_exists(#take) OR #take <> :take)',
+          ExpressionAttributeNames: { '#reviews': 'reviews', '#ttl': 'ttl', '#take': 'lastTake' },
+          ExpressionAttributeValues: { ':one': 1, ':cap': cap, ':ttl': epochSeconds() + AUTO_REVIEW_TTL_SECONDS, ':take': takeId },
           ReturnValues: 'UPDATED_NEW',
+          ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
         }));
-        const taken = (resp.Attributes as { reviews?: unknown } | undefined)?.reviews;
-        if (typeof taken !== 'number') throw new Error(`no review count for ${autoReviewKey(repo, prNumber)}`);
-        return taken;
+        taken = (resp.Attributes as { reviews?: unknown } | undefined)?.reviews;
       } catch (err) {
-        if (isConditionFailure(err)) return 0;
-        throw err;
+        if (!isConditionFailure(err)) throw err;
+        if (failedItemValue(err, 'lastTake') !== takeId) return 0;
+        taken = failedItemValue(err, 'reviews');
       }
+      if (typeof taken !== 'number') throw new Error(`no review count for ${autoReviewKey(repo, prNumber)}`);
+      return taken;
     },
 
     async returnAutoReview(repo, prNumber) {
+      const returnId = randomUUID();
       try {
         await ddb.send(new UpdateCommand({
           TableName: tableName,
           Key: { key: autoReviewKey(repo, prNumber) },
-          UpdateExpression: 'ADD #reviews :minusOne',
-          ConditionExpression: '#reviews > :zero',
-          ExpressionAttributeNames: { '#reviews': 'reviews' },
-          ExpressionAttributeValues: { ':minusOne': -1, ':zero': 0 },
+          UpdateExpression: 'SET #return = :return ADD #reviews :minusOne',
+          ConditionExpression: '#reviews > :zero AND (attribute_not_exists(#return) OR #return <> :return)',
+          ExpressionAttributeNames: { '#reviews': 'reviews', '#return': 'lastReturn' },
+          ExpressionAttributeValues: { ':minusOne': -1, ':zero': 0, ':return': returnId },
         }));
       } catch (err) {
-        // Nothing left to give back.
+        // Nothing left to give back, or a retry of this call, which gave it back.
         if (isConditionFailure(err)) return;
         throw err;
       }
@@ -289,10 +322,11 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
           ConditionExpression: 'attribute_not_exists(#k) OR #ttl < :now',
           ExpressionAttributeNames: { '#k': 'key', '#ttl': 'ttl' },
           ExpressionAttributeValues: { ':now': epochSeconds() },
+          ReturnValuesOnConditionCheckFailure: 'ALL_OLD',
         }));
         return marker;
       } catch (err) {
-        if (isConditionFailure(err)) return null;
+        if (isConditionFailure(err)) return failedItemValue(err, 'marker') === marker ? marker : null;
         throw err;
       }
     },
@@ -300,15 +334,17 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
     clearReviewPending: (repo, prNumber, markerId) => clearPendingReview(ddb, tableName, repo, prNumber, markerId),
 
     async markRoundGivenBack(repo, prNumber) {
+      // The note is the call's id, so a retry of this call finds its own note.
+      const noteId = randomUUID();
       try {
         await ddb.send(new UpdateCommand({
           TableName: tableName,
           Key: { key: pendingReviewKey(repo, prNumber) },
-          UpdateExpression: 'SET #r = :true',
+          UpdateExpression: 'SET #r = :note',
           // A marker that is there and has not expired, as hasPendingReview counts it.
-          ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)',
+          ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND (attribute_not_exists(#r) OR #r = :note)',
           ExpressionAttributeNames: { '#m': 'marker', '#ttl': 'ttl', '#r': 'roundGivenBack' },
-          ExpressionAttributeValues: { ':true': true, ':now': epochSeconds() },
+          ExpressionAttributeValues: { ':note': noteId, ':now': epochSeconds() },
         }));
         return true;
       } catch (err) {
@@ -318,13 +354,16 @@ export function createDeliveryStore(ddb: DocumentClient, tableName: string, now:
     },
 
     async clearRoundGivenBack(repo, prNumber) {
+      // The call leaves its id, so a retry of this call finds the note gone by its own hand.
+      const clearId = randomUUID();
       try {
         await ddb.send(new UpdateCommand({
           TableName: tableName,
           Key: { key: pendingReviewKey(repo, prNumber) },
-          UpdateExpression: 'REMOVE #r',
-          ConditionExpression: 'attribute_exists(#r)',
-          ExpressionAttributeNames: { '#r': 'roundGivenBack' },
+          UpdateExpression: 'SET #c = :clear REMOVE #r',
+          ConditionExpression: 'attribute_exists(#r) OR #c = :clear',
+          ExpressionAttributeNames: { '#r': 'roundGivenBack', '#c': 'noteCleared' },
+          ExpressionAttributeValues: { ':clear': clearId },
         }));
         return true;
       } catch (err) {

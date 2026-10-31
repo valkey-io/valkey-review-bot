@@ -1,4 +1,5 @@
 import { createAppAuth } from '@octokit/auth-app';
+import { request } from '@octokit/request';
 import type { GitHubUser } from './config.js';
 
 /** The webhook payload fields this package reads. GitHub sends many more. */
@@ -13,7 +14,10 @@ export interface WebhookPayload {
     readonly head?: { readonly sha?: string };
     readonly draft?: boolean;
     readonly merged?: boolean;
+    readonly updated_at?: string;
   };
+  /** pull_request edited: what the edit changed. `base` is present when the PR now targets another branch. */
+  readonly changes?: { readonly base?: unknown };
   readonly issue?: {
     readonly number?: number;
     readonly user?: GitHubUser;
@@ -113,7 +117,7 @@ export interface InstallationTokenRequest {
 }
 
 async function issueInstallationToken(r: InstallationTokenRequest): Promise<{ token: string; expiresAt: string }> {
-  const auth = createAppAuth({ appId: r.appId, privateKey: r.privateKey, installationId: r.installationId });
+  const auth = createAppAuth({ appId: r.appId, privateKey: r.privateKey, installationId: r.installationId, request: boundedRequest() });
   return auth({ type: 'installation', permissions: { ...r.permissions } });
 }
 
@@ -146,6 +150,27 @@ export type GitHubApi = (method: 'GET' | 'POST' | 'PATCH', path: string, body?: 
 /** The receiver has 30 seconds per delivery; no single GitHub call may use most of it. */
 const GITHUB_TIMEOUT_MS = 8_000;
 
+/** Statuses whose response has no body; a Response cannot be built with one. */
+const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+
+/**
+ * @octokit/request with the same bound on each call, for the token
+ * exchange of @octokit/auth-app, which sets none of its own. The body is
+ * read under the bound too. @octokit/request turns a body that fails to
+ * read into an empty one with the status, and auth-app then returns no
+ * token; read here, a cut-off body fails the call.
+ */
+export function boundedRequest(timeoutMs: number = GITHUB_TIMEOUT_MS): typeof request {
+  const boundedFetch = async (url: string, init: RequestInit): Promise<Response> => {
+    const resp = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+    const body = resp.body === null || NULL_BODY_STATUSES.has(resp.status) ? null : await resp.arrayBuffer();
+    const buffered = new Response(body, { status: resp.status, statusText: resp.statusText, headers: resp.headers });
+    Object.defineProperty(buffered, 'url', { value: resp.url });
+    return buffered;
+  };
+  return request.defaults({ request: { fetch: boundedFetch } });
+}
+
 export function githubApi(token: string, fetchImpl: typeof fetch = fetch): GitHubApi {
   return async (method, path, body) => {
     const resp = await fetchImpl(`https://api.github.com/${path}`, {
@@ -159,11 +184,14 @@ export function githubApi(token: string, fetchImpl: typeof fetch = fetch): GitHu
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     });
+    // A body cut off by the bound or by a dropped connection fails the
+    // call; only an empty or non-JSON body reads as {}.
+    const text = await resp.text();
     let json: unknown = {};
     try {
-      json = await resp.json();
+      if (text) json = JSON.parse(text);
     } catch {
-      // Empty or non-JSON body; callers go by the status.
+      // Not JSON; callers go by the status.
     }
     return { status: resp.status, json };
   };

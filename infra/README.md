@@ -223,8 +223,8 @@ reviewer. The token broker issues tokens only for these repositories.
 | `reviewer` | required | `valkey-review` or `valkey-glide-review`. |
 | `repo` | required | `owner/name`, spelled as GitHub shows it. A repository can appear in one route only (compared case-insensitively). |
 | `threadReplyReview` | `false` | A maintainer tagging the bot in a reply inside any review thread starts a review. In a thread the bot started, that review answers the reply from the code: it verifies a claimed fix, re-checks a disputed finding (and withdraws it if the reply is right), or answers a question. In any other thread the tag is an ordinary summons. When `false`, tags in review-thread replies start nothing (the replies are still feedback). Enable it on every route where maintainers should be able to answer the bot; the example does so on both routes. |
-| `skipDrafts` | `false` | Draft pull requests are not reviewed when opened or pushed to; the review runs when the draft is marked ready. |
-| `mentionOnly` | `false` | No automatic reviews, on open, reopen or new commits. Reviews run only when a maintainer tags the bot. |
+| `skipDrafts` | `false` | Draft pull requests are not reviewed when opened, pushed to or moved to a new base; the review runs when the draft is marked ready. |
+| `mentionOnly` | `false` | No automatic reviews, on open, reopen, new commits or a new base. Reviews run only when a maintainer tags the bot. |
 | `authorAllowlist` | `[]` | When not empty, only pull requests by these logins get automatic reviews. |
 
 ### `curatorOnlyRoutes`
@@ -387,7 +387,8 @@ automatic reviews.
 ### `maxAutomaticReviewsPerPr`
 
 Default `3`, from 1 to 20. Automatic reviews one pull request can get,
-counting the first: on open, reopen, `ready_for_review` and new commits.
+counting the first: on open, reopen, `ready_for_review`, new commits and a
+new base branch.
 Further events are skipped as `auto-review-cap`. @mentions and thread
 replies are not counted. A review still waiting when the pull request is
 closed, or turned back into a draft on a `skipDrafts` route, gives its
@@ -400,8 +401,8 @@ expires 180 days after the pull request's latest automatic review.
 ### `pushReviewDelaySeconds`
 
 Default `300`, from 0 to 900 (the SQS limit). How long a review that new
-commits started waits in the queue. Pushes, reopens and `ready_for_review`
-events while it waits join it, so a burst gets one review of the newest
+commits or a new base branch started waits in the queue. Pushes, reopens,
+base changes and `ready_for_review` events while it waits join it, so a burst gets one review of the newest
 head. Passed to the receiver as `PUSH_REVIEW_DELAY_SECONDS`. The delay comes
 out of the review's 90-minute run budget.
 

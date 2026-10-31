@@ -29,7 +29,7 @@ export function stripStateMarker(text: string): string {
 
 export const reviewStateSchema = z.object({
   status: z.enum(['needs_work', 'ready_for_human_review']).describe(
-    '"ready_for_human_review" only when you would approve this PR as it stands: no open blocking finding and no open direction concern. Otherwise "needs_work".',
+    '"ready_for_human_review" only when you would approve this PR as it stands: no open blocking finding and no open direction concern. Otherwise "needs_work", which needs an open blocking finding or a `direction`: open minor findings alone are "ready_for_human_review".',
   ),
   summary: z.string().min(1).describe('One or two short, plain sentences on where the PR stands now. If you dropped an earlier finding as wrong, say why here.'),
   risk: z.enum(['low', 'medium', 'high']).describe('Risk of merging the PR as it stands at this head.'),
@@ -56,14 +56,16 @@ export type ReviewState = z.infer<typeof reviewStateSchema>;
  * when known, a "needed" backport may only name those.
  */
 export function validateReviewState(state: ReviewState, releaseBranches?: readonly string[] | null): string | null {
+  const openBlocking = state.findings.filter((f) => f.blocking && !f.resolved);
   if (state.status === 'ready_for_human_review') {
-    const openBlocking = state.findings.filter((f) => f.blocking && !f.resolved);
     if (openBlocking.length > 0) {
       return `status is "ready_for_human_review" but ${openBlocking.length} blocking finding(s) are still open. Mark them resolved only if fixed at this head; otherwise set status to "needs_work".`;
     }
     if (state.direction.trim()) {
       return 'status is "ready_for_human_review" but `direction` proposes a different approach. Either set status to "needs_work" or clear `direction`.';
     }
+  } else if (openBlocking.length === 0 && !state.direction.trim()) {
+    return 'status is "needs_work" but no blocking finding is open and `direction` is empty. Set status to "ready_for_human_review", or list the blocking finding that is still open.';
   }
   const bp = state.backport;
   if (bp.verdict === 'needed') {
@@ -101,7 +103,116 @@ function findingLine(f: ReviewState['findings'][number]): string {
   return `- ${minor}${where}${oneLine(f.summary)}`;
 }
 
-export function renderReviewState(state: ReviewState, headSha: string, now: Date = new Date()): string {
+/**
+ * What a state comment was written for. `head` is the PR head the run
+ * saw and `base` the branch it reviewed against. `fullReview` is the
+ * latest head a full review covered and `fullReviewBase` the base that
+ * review was against. A partial run, a focused @mention or thread-reply
+ * run or a review the model call limit stopped, carries both over.
+ * `fullReview` is null when no full review has run, and a 10-hex prefix
+ * when it was carried over from a comment written before this line
+ * existed; such a comment did not record the base, so `fullReviewBase`
+ * is then null.
+ */
+export interface ReviewHeads {
+  readonly head: string;
+  readonly base: string;
+  readonly fullReview: string | null;
+  readonly fullReviewBase: string | null;
+}
+
+/** The last full review an earlier state comment records. `base` is null when that comment did not record it. */
+export interface FullReview {
+  readonly head: string;
+  readonly base: string | null;
+}
+
+const HEADS_PREFIX = '<!-- valkey-reviewer:heads ';
+const HEADS_SUFFIX = ' -->';
+
+/** True when the last full review covered `heads.head` against `heads.base`. */
+export function fullyReviewed(heads: ReviewHeads): boolean {
+  return heads.fullReview !== null && heads.head.startsWith(heads.fullReview)
+    && (heads.fullReviewBase === null || heads.fullReviewBase === heads.base);
+}
+
+/**
+ * The comment's last line: `heads` as JSON inside an HTML comment, which
+ * GitHub does not show. Only the runtime writes it, after all model
+ * text, so a reader that takes only the last line cannot be handed a
+ * line the model wrote. `<` and `>` are escaped, so no value can end the
+ * HTML comment early.
+ */
+function headsLine(heads: ReviewHeads): string {
+  const json = JSON.stringify({
+    head: heads.head,
+    base: heads.base,
+    full_review: heads.fullReview,
+    full_review_base: heads.fullReviewBase,
+  }).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  return `${HEADS_PREFIX}${json}${HEADS_SUFFIX}`;
+}
+
+function lastLine(body: string): string {
+  return body.trimEnd().split(/\r?\n/).pop() ?? '';
+}
+
+/** The JSON object a state comment's heads line holds, or null when that line is missing or malformed. */
+function headsJson(body: string): Record<string, unknown> | null {
+  const line = lastLine(body);
+  if (!line.startsWith(HEADS_PREFIX) || !line.endsWith(HEADS_SUFFIX)) return null;
+  try {
+    const value: unknown = JSON.parse(line.slice(HEADS_PREFIX.length, -HEADS_SUFFIX.length));
+    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The heads a state comment's last line records, or null when that line is missing or malformed. */
+export function parseReviewHeads(body: string): ReviewHeads | null {
+  const v = headsJson(body);
+  if (!v) return null;
+  if (typeof v.head !== 'string' || !/^[0-9a-f]{40}$/.test(v.head) || typeof v.base !== 'string') return null;
+  const full = v.full_review;
+  if (full !== null && (typeof full !== 'string' || !/^[0-9a-f]{10,40}$/.test(full))) return null;
+  const fullBase = v.full_review_base;
+  if (fullBase !== null && typeof fullBase !== 'string') return null;
+  return { head: v.head, base: v.base, fullReview: full, fullReviewBase: fullBase };
+}
+
+/**
+ * The latest full review, from the state comment an earlier run wrote. A
+ * comment from before the heads line ends with the footer instead. It
+ * does not say which runs were full reviews, so its stamp is taken as
+ * one.
+ */
+export function previousFullReview(body: string): FullReview | null {
+  const heads = parseReviewHeads(body);
+  if (heads) return heads.fullReview === null ? null : { head: heads.fullReview, base: heads.fullReviewBase };
+  const legacy = /^<sub>Updated for ([0-9a-f]{10}) at /.exec(lastLine(body));
+  return legacy ? { head: legacy[1]!, base: null } : null;
+}
+
+/** `body` without its heads line, for showing a state comment to the model. */
+export function stripHeadsLine(body: string): string {
+  const lines = body.trimEnd().split(/\r?\n/);
+  if (lines.at(-1)?.startsWith(HEADS_PREFIX)) lines.pop();
+  return lines.join('\n');
+}
+
+/** The footer's note on a state that no full review covers, or "". */
+function coverageNote(heads: ReviewHeads): string {
+  if (fullyReviewed(heads)) return '';
+  if (heads.fullReview === null) return ' after a partial review; no full review has run yet';
+  // A branch name may hold a backtick; it would end the code span.
+  const against = heads.fullReviewBase !== null && heads.fullReviewBase !== heads.base
+    ? ` against \`${oneLine(heads.fullReviewBase).replace(/`/g, "'")}\``
+    : '';
+  return ` after a partial review; the last full review was at ${heads.fullReview.slice(0, 10)}${against}`;
+}
+
+export function renderReviewState(state: ReviewState, heads: ReviewHeads, now: Date = new Date()): string {
   const open = state.findings.filter((f) => !f.resolved);
   const resolved = state.findings.filter((f) => f.resolved);
   const lines: string[] = [STATE_MARKER, '### Review state', ''];
@@ -137,7 +248,9 @@ export function renderReviewState(state: ReviewState, headSha: string, now: Date
   }
 
   const stamp = now.toISOString().slice(0, 16).replace('T', ' ');
-  lines.push(`<sub>Updated for ${headSha.slice(0, 10)} at ${stamp} UTC. The bot rewrites this comment on every review.</sub>`);
+  const headSha = heads.head;
+  lines.push(`<sub>Updated for ${headSha.slice(0, 10)} at ${stamp} UTC${coverageNote(heads)}. The bot rewrites this comment on every review.</sub>`);
+  lines.push(headsLine(heads));
   return lines.join('\n');
 }
 

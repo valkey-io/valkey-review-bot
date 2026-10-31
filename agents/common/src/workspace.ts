@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import type { Octokit } from '@octokit/rest';
-import { STATE_MARKER } from './review-state.js';
+import { STATE_MARKER, stripHeadsLine } from './review-state.js';
 import type { TokenSource } from './github-auth.js';
 
 // Same filter as the image clone (see the Dockerfiles). Fetching with
@@ -41,9 +41,9 @@ export interface InvocationPayload {
   readonly installation_id: number;
   /**
    * Set on every automatic review, the ones the receiver starts for a
-   * pull_request event: "opened", "reopened", "ready_for_review" or
-   * "push" (new commits). @mention runs, thread replies included, have
-   * none.
+   * pull_request event: "opened", "reopened", "ready_for_review", "push"
+   * (new commits) or "base_changed" (the PR now targets another branch).
+   * @mention runs, thread replies included, have none.
    */
   readonly trigger?: string;
   /** The route's skipDrafts setting, sent with automatic reviews. */
@@ -69,6 +69,12 @@ export interface PrContext {
   readonly owner: string;
   readonly repo: string;
   readonly prNumber: number;
+  /**
+   * The automatic review's trigger (InvocationPayload.trigger), or null on
+   * an @mention run. An automatic review is a full review unless the
+   * model says it did not finish or the model call limit stopped it.
+   */
+  readonly trigger: string | null;
   readonly headSha: string;
   readonly baseSha: string;
   readonly mergeBaseSha: string;
@@ -359,6 +365,7 @@ export async function prepareWorkspace(
     owner,
     repo: repoName,
     prNumber: payload.pr_number,
+    trigger: payload.trigger ?? null,
     headSha,
     baseSha,
     mergeBaseSha,
@@ -489,7 +496,7 @@ export function renderPrOverview(ctx: PrContext): string {
   if (ctx.previousState) {
     lines.push('Your state comment from an earlier run, in full. Carry every finding forward into this run\'s `state`, marked resolved if it is fixed at the current head or else still open. Drop one only if it is shown to be wrong, and give the reason in `summary`.');
     lines.push('');
-    lines.push(ctx.previousState.body.replace(STATE_MARKER, '').trim());
+    lines.push(stripHeadsLine(ctx.previousState.body).replace(STATE_MARKER, '').trim());
   } else {
     lines.push('(none: this is the first review of this PR)');
   }

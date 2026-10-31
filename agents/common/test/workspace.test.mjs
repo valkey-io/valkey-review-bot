@@ -207,7 +207,7 @@ test('release lines are listed by the names backport.branches accepts', () => {
   const listed = [...overview.matchAll(/`([^`]+)` \(ref `upstream\/\1`/g)].map((m) => m[1]);
   assert.deepEqual(listed, ['9.0', '8.1']);
   const state = reviewStateSchema.parse({
-    status: 'needs_work', summary: 's', risk: 'low', risk_reason: 'r',
+    status: 'ready_for_human_review', summary: 's', risk: 'low', risk_reason: 'r',
     backport: { verdict: 'needed', branches: listed, reason: 'r' },
   });
   assert.equal(validateReviewState(state, releaseLines.map((r) => r.branch)), null);
@@ -217,6 +217,13 @@ test('the previous state is shown without its marker', () => {
   const overview = renderPrOverview({ ...baseCtx, previousState: { id: 5, body: `${STATE_MARKER}\n### Review state\nOpen: one` } });
   assert.match(overview, /## Your previous review state\n.*\n\n### Review state\nOpen: one/);
   assert.ok(!overview.includes(STATE_MARKER));
+});
+
+test('the previous state is shown without its heads line', () => {
+  const heads = '<!-- valkey-reviewer:heads {"head":"abc","base":"unstable","full_review":"abc"} -->';
+  const overview = renderPrOverview({ ...baseCtx, previousState: { id: 5, body: `${STATE_MARKER}\n### Review state\nOpen: one\n<sub>Updated</sub>\n${heads}` } });
+  assert.match(overview, /Open: one\n<sub>Updated<\/sub>\n/);
+  assert.ok(!overview.includes('valkey-reviewer:heads'));
 });
 
 test('the previous state is carried over by the same rule the reviewer prompts give', () => {

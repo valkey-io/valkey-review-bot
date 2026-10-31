@@ -40,6 +40,8 @@ export interface AssembleBaseOpts {
    * when they succeed, and that is how the run knows the review is done.
    */
   readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
+  /** Pass this to assembleCommonTools too: true once the model call limit stopped the review. */
+  readonly callLimitReached?: () => boolean;
 }
 
 export type AssembleTools = (opts: AssembleBaseOpts) => Promise<readonly unknown[]>;
@@ -64,8 +66,9 @@ export const requestSchema = z.object({
   trigger_path: z.string().optional(),
   trigger_line: z.number().int().positive().optional(),
   // Automatic-review fields (receiver's pull_request path). trigger is
-  // "opened", "reopened", "ready_for_review" or "push" (new commits), and
-  // is absent on @mention runs; skip_drafts is the route's skipDrafts. An
+  // "opened", "reopened", "ready_for_review", "push" (new commits) or
+  // "base_changed", and is absent on @mention runs; skip_drafts is the
+  // route's skipDrafts. An
   // automatic review can wait a long time before it runs, so the run
   // checks again that the PR still wants it (see automaticReviewSkipReason
   // in workspace.ts). Any string is accepted, so a receiver that sends a
@@ -129,6 +132,7 @@ const TERMINAL_RETRY_MESSAGE = [
   'Do not continue in free text. If you found one or more evidence-backed findings, call `post_review` now.',
   'If no finding meets the evidence bar, call `skip_review` now with a one-sentence reason.',
   'You must call exactly one of `post_review` or `skip_review`.',
+  'If you did not finish reviewing the whole PR, say in the state summary what you did not reach, and set `full_review: false`; the state then records a partial review. Set the status from the findings you have.',
 ].join('\n');
 
 function isTool(value: unknown): value is Tool {
@@ -217,6 +221,9 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
     };
 
     let statusComment: StatusComment | undefined;
+    // Set when the model call limit stops the review; the terminal tools
+    // then record the state as a partial review.
+    let limitReached = false;
     // Everything below runs under this try, so a failure, or the
     // caller closing the stream early, still stops the status comment
     // timer and records how the run ended.
@@ -302,6 +309,7 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
         env,
         statusComment,
         onTerminal,
+        callLimitReached: () => limitReached,
       });
       if (!isTerminalCallbackWired(onTerminal)) {
         throw new Error('assembleTools did not pass onTerminal to assembleCommonTools, so the run could not tell when the review is done');
@@ -368,7 +376,10 @@ export function createReviewHandler(opts: ReviewHandlerOpts): (payload: Payload)
             if (outgoing) yield outgoing;
           }
           if (terminal.tool === null) {
-            if (callLimit.reached) console.warn(`[stream] model call limit (${env.maxIterations}) reached without a terminal tool`);
+            if (callLimit.cancelled) {
+              limitReached = true;
+              console.warn(`[stream] model call limit (${env.maxIterations}) reached without a terminal tool`);
+            }
             callLimit.reserve(TERMINAL_RETRY_CALLS);
             yield { event: 'status', data: { phase: 'terminal_retry' } };
             for await (const event of agent.stream(TERMINAL_RETRY_MESSAGE)) {
