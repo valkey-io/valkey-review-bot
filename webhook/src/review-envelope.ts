@@ -19,15 +19,16 @@ export interface ReviewEnvelope {
    * Separates this run's heartbeat from an earlier run on the same head
    * SHA: "m<comment id>" for @mention runs, "reopened" for the review a
    * reopened PR gets, "ready" for the review that a draft PR gets when it
-   * is marked ready, "push" for reviews of new commits. An opened PR's
-   * review has none.
+   * is marked ready, "push" for reviews of new commits, "base<seconds>"
+   * for the review of a new base branch (the PR's updated_at in Unix
+   * seconds). An opened PR's review has none.
    */
   readonly run_nonce?: string;
   readonly trigger_path?: string;
   readonly trigger_line?: number;
   /**
-   * Automatic reviews (opened, reopened, ready_for_review and new
-   * commits): the id of the pull request's pending marker (src/store.ts),
+   * Automatic reviews (opened, reopened, ready_for_review, new commits
+   * and a new base): the id of the pull request's pending marker (src/store.ts),
    * which the worker removes when it starts the run. The runtime ignores
    * it.
    */
@@ -45,8 +46,12 @@ export interface ReviewEnvelope {
   readonly skip_drafts?: boolean;
 }
 
-/** "push" is pull_request synchronize: new commits. */
-export type AutomaticTrigger = 'opened' | 'reopened' | 'ready_for_review' | 'push';
+/**
+ * "push" is pull_request synchronize: new commits. "base_changed" is
+ * pull_request edited with a new base branch: the same head, but a
+ * different diff.
+ */
+export type AutomaticTrigger = 'opened' | 'reopened' | 'ready_for_review' | 'push' | 'base_changed';
 
 export interface PendingMarker {
   readonly repo: string;

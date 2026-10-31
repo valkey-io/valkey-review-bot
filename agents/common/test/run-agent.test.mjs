@@ -379,3 +379,50 @@ test('an automatic review that is closed at the done frame stays completed', asy
   assert.equal(frames.at(-1).data.skip_reason, 'the pull request is a draft and this route skips drafts');
   assert.deepEqual(written, ['running', 'completed']);
 });
+
+/** Runs an automatic review with a model call limit of 2 and the real terminal tools; returns what it wrote. */
+async function runWithCallLimit(turns) {
+  const model = new ScriptedModel(turns);
+  const stateBodies = [];
+  const handler = createReviewHandler({
+    env: { ...env, maxIterations: 2 },
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ ctx: prCtx, octokit, tokens, onTerminal, callLimitReached }) => {
+      const deps = {
+        ctx: prCtx, octokit, tokens, callLimitReached,
+        stateWriter: { write: async (body) => { stateBodies.push(body); return { id: 1, url: 'https://github.com/state' }; } },
+        terminalGate: createTerminalGate(onTerminal),
+      };
+      return [noop, buildPostReviewTool(deps), buildSkipTool(deps)];
+    },
+    deps: {
+      createModel: () => model,
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ({ ...ctx, trigger: 'push' }),
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+    },
+  });
+  const frames = await consume(handler(payload));
+  return { frames, stateBodies, model };
+}
+
+test('a review the model call limit stopped is recorded as a partial review', async (t) => {
+  recordHeartbeats(t);
+  const { frames, stateBodies, model } = await runWithCallLimit([noopTurn, noopTurn, skipTurn, textTurn('Done.')]);
+  assert.ok(frames.some((f) => f.event === 'status' && f.data.phase === 'terminal_retry'));
+  assert.equal(frames.at(-1).data.terminal_tool, 'skip_review');
+  assert.match(stateBodies[0], /after a partial review; no full review has run yet/);
+  assert.match(stateBodies[0].split('\n').at(-1), /"full_review":null/);
+  assert.match(textOf(model.sent.at(-2).at(-1)), /set `full_review: false`/);
+});
+
+test('a review that ends its turn on the last allowed call was not stopped by the limit', async (t) => {
+  recordHeartbeats(t);
+  const { frames, stateBodies } = await runWithCallLimit([noopTurn, textTurn('I reviewed every file.'), skipTurn, textTurn('Done.')]);
+  assert.ok(frames.some((f) => f.event === 'status' && f.data.phase === 'terminal_retry'));
+  assert.equal(frames.at(-1).data.terminal_tool, 'skip_review');
+  assert.doesNotMatch(stateBodies[0], /partial review/);
+  assert.match(stateBodies[0].split('\n').at(-1), /"full_review":"/);
+});

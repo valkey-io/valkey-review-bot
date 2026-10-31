@@ -4,7 +4,10 @@ import type { Octokit } from '@octokit/rest';
 import type { PrContext } from '../workspace.js';
 import type { StatusComment } from '../status-comment.js';
 import type { TokenSource } from '../github-auth.js';
-import { reviewStateSchema, renderReviewState, stripStateMarker, validateReviewState, type ReviewState, type StateCommentWriter } from '../review-state.js';
+import {
+  previousFullReview, reviewStateSchema, renderReviewState, stripStateMarker, validateReviewState,
+  type ReviewHeads, type ReviewState, type StateCommentWriter,
+} from '../review-state.js';
 import { runBounded } from './spawn.js';
 
 /**
@@ -72,7 +75,12 @@ export type TerminalToolName = 'post_review' | 'skip_review';
 export interface TerminalGate {
   /** Claim the gate before writing to GitHub. Returns an error message when it is taken. */
   acquire(tool: TerminalToolName): string | null;
-  /** Give the gate back after a call that wrote nothing, so the model can retry. */
+  /**
+   * Give the gate back after a call that wrote nothing, so the model can
+   * retry. post_review also gives it back after a submission that may
+   * have made the review without saying so; its next call looks for that
+   * review before posting.
+   */
   release(): void;
   /** Mark the run's review as done and tell the run loop. */
   complete(tool: TerminalToolName, result: string): void;
@@ -128,6 +136,12 @@ export interface GhToolsDeps {
    * run. When absent, each tool gets a gate of its own.
    */
   readonly terminalGate?: TerminalGate;
+  /**
+   * True once the model call limit stopped the review. The run loop then
+   * asks for a terminal call, and the state it writes is recorded as a
+   * partial review.
+   */
+  readonly callLimitReached?: () => boolean;
 }
 
 /** Repositories gh_api_read may read: the PR's and the upstream the release branches come from. */
@@ -135,9 +149,24 @@ function readableRepos(ctx: PrContext): string[] {
   return [`${ctx.owner}/${ctx.repo}`, ...(ctx.upstreamRepo ? [ctx.upstreamRepo] : [])];
 }
 
-function checkState(deps: GhToolsDeps, state: ReviewState): string | null {
+/**
+ * The heads this run's state is written for. An automatic review is a
+ * full review unless the model says it did not finish. An @mention run is
+ * one only when the model says it reviewed the whole PR. A review the
+ * call limit stopped is not, whatever the model says. A run that is not a
+ * full review keeps the previous state's.
+ */
+function runHeads(deps: GhToolsDeps, fullReview: boolean | undefined): ReviewHeads {
+  const { ctx } = deps;
+  const full = !deps.callLimitReached?.() && (fullReview ?? Boolean(ctx.trigger));
+  if (full) return { head: ctx.headSha, base: ctx.baseRef, fullReview: ctx.headSha, fullReviewBase: ctx.baseRef };
+  const last = ctx.previousState ? previousFullReview(ctx.previousState.body) : null;
+  return { head: ctx.headSha, base: ctx.baseRef, fullReview: last?.head ?? null, fullReviewBase: last?.base ?? null };
+}
+
+function checkState(deps: GhToolsDeps, state: ReviewState, heads: ReviewHeads): string | null {
   return validateReviewState(state, deps.ctx.releaseLines?.map((r) => r.branch) ?? null)
-    ?? tooLong('The rendered review state', renderReviewState(state, deps.ctx.headSha));
+    ?? tooLong('The rendered review state', renderReviewState(state, heads));
 }
 
 /**
@@ -147,9 +176,13 @@ function checkState(deps: GhToolsDeps, state: ReviewState): string | null {
  * terminal tool is redelivered and reviewed a second time. The write may
  * also have reached GitHub even though the request reported an error.
  */
-async function writeState(deps: GhToolsDeps, state: ReviewState): Promise<{ url: string | null; error: string | null }> {
+async function writeState(
+  deps: GhToolsDeps,
+  state: ReviewState,
+  heads: ReviewHeads,
+): Promise<{ url: string | null; error: string | null }> {
   try {
-    const { url } = await deps.stateWriter.write(renderReviewState(state, deps.ctx.headSha));
+    const { url } = await deps.stateWriter.write(renderReviewState(state, heads));
     return { url, error: null };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -165,6 +198,59 @@ function stateError(error: string | null): { state_comment_error?: string } {
 
 /** Status-comment text for a mention run that ends without an inline comment or a reply. */
 const NOTHING_NEW = 'Review complete. Nothing new met the bar for an inline comment.';
+
+const fullReviewSchema = z.boolean().optional().describe(
+  'On a mention-triggered run, true only if this run reviewed the whole PR at the current head, not just the area or the thread the request named. On an automatic review, false if you did not finish reviewing the whole PR. Leave it unset otherwise.',
+);
+
+/** A review comment's text, for comparing what was posted with what was sent. */
+function sameText(a: string | null | undefined, b: string): boolean {
+  return (a ?? '').replace(/\r\n/g, '\n').trim() === b.replace(/\r\n/g, '\n').trim();
+}
+
+/** True when the posted comments are the sent ones: the same paths and texts, as many of each. */
+function sameComments(
+  posted: readonly { readonly path: string; readonly body: string }[],
+  sent: readonly { readonly path: string; readonly body: string }[],
+): boolean {
+  if (posted.length !== sent.length) return false;
+  const left = [...posted];
+  return sent.every((c) => {
+    const i = left.findIndex((p) => p.path === c.path && sameText(p.body, c.body));
+    if (i === -1) return false;
+    left.splice(i, 1);
+    return true;
+  });
+}
+
+/**
+ * The review this App made from `body` and `comments` at the head,
+ * submitted at or after `since`, or null. It tells whether a review
+ * submission that got no answer, or a server error, made the review
+ * anyway. The comments are compared too: another run of the App can
+ * review the same head at the same time.
+ */
+async function findOwnReview(
+  deps: GhToolsDeps,
+  since: string,
+  body: string,
+  comments: readonly { readonly path: string; readonly body: string }[],
+): Promise<{ id: number; url: string } | null> {
+  const { ctx, octokit } = deps;
+  // An installation token's viewer is the App's bot account.
+  const { viewer } = await octokit.graphql<{ viewer: { databaseId: number | null } }>('query { viewer { databaseId } }');
+  if (viewer.databaseId === null) throw new Error('GitHub did not say which account the token belongs to');
+  const pr = { owner: ctx.owner, repo: ctx.repo, pull_number: ctx.prNumber, per_page: 100 };
+  const reviews = await octokit.paginate(octokit.pulls.listReviews, pr);
+  // GitHub's submitted_at and `since` have the same form, so they compare as strings.
+  const candidates = reviews.filter((r) => r.user?.id === viewer.databaseId && r.commit_id === ctx.headSha
+    && (r.submitted_at ?? '') >= since && sameText(r.body, body));
+  for (const r of candidates) {
+    const posted = await octokit.paginate(octokit.pulls.listCommentsForReview, { ...pr, review_id: r.id });
+    if (sameComments(posted, comments)) return { id: r.id, url: r.html_url };
+  }
+  return null;
+}
 
 function withStateLink(text: string, stateUrl: string | null): string {
   return stateUrl ? `${text}\n\nCurrent review state: ${stateUrl}` : text;
@@ -216,6 +302,9 @@ Do NOT include a leading slash. Append query strings inline, e.g. \`repos/OWNER/
  */
 export function buildPostReviewTool(deps: GhToolsDeps) {
   const gate = deps.terminalGate ?? createTerminalGate();
+  // When a submission may have made the review without saying so, the
+  // time it started. The next call looks for that review before it posts.
+  let unanswered: string | null = null;
   return tool({
     name: 'post_review',
     description:
@@ -225,6 +314,7 @@ Supply:
 - \`body\`: on a mention-triggered run, the short reply to the requester. Otherwise leave it empty; the summary lives in \`state\`.
 - \`comments\`: an array of inline comments. Each item: { path, line, side?, body }. \`line\` is 1-indexed in the RIGHT file (side: "RIGHT" default). Use \`start_line\` + \`line\` for multi-line comments. Anchor only to lines present in the PR diff.
 - \`state\`: the full current review state. The runtime renders it into the PR's single review-state comment and rewrites that comment on every run.
+- \`full_review\`: on a mention-triggered run, true only if you reviewed the whole PR at this head. On an automatic review, false if you did not finish it.
 
 \`body\` and each comment body may be at most ${MAX_GITHUB_TEXT_CHARS} characters.
 
@@ -242,11 +332,13 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
         body: z.string(),
       })).default([]),
       state: reviewStateSchema,
+      full_review: fullReviewSchema,
     }),
     callback: async (input) => {
+      const heads = runHeads(deps, input.full_review);
       const invalid = tooLong('`body`', input.body)
         ?? input.comments.map((c, i) => tooLong(`comments[${i}].body`, c.body)).find((e) => e !== null)
-        ?? checkState(deps, input.state);
+        ?? checkState(deps, input.state, heads);
       if (invalid) return `ERROR: nothing was posted. ${invalid}`;
       const taken = gate.acquire('post_review');
       if (taken) return taken;
@@ -260,7 +352,18 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
       let review: { id: number; url: string } | null = null;
       // GitHub rejects an empty-body, zero-comment review, and with
       // nothing to anchor there is nothing a review object would add.
-      if (input.comments.length > 0 || reviewBody) {
+      if ((input.comments.length > 0 || reviewBody) && unanswered !== null) {
+        try {
+          review = await findOwnReview(deps, unanswered, reviewBody, input.comments);
+        } catch (err) {
+          gate.release();
+          return `ERROR: nothing was posted. An earlier post_review may have posted the review, and checking for it failed: ${err instanceof Error ? err.message : String(err)}. Call post_review again with the same input.`;
+        }
+        if (review) console.log(`[post_review] review ${review.id} from an earlier call is on the PR; not posting it again`);
+      }
+      if ((input.comments.length > 0 || reviewBody) && !review) {
+        // Second precision: GitHub's submitted_at has no milliseconds.
+        const startedAt = `${new Date(Date.now() - 1000).toISOString().slice(0, 19)}Z`;
         try {
           const resp = await deps.octokit.pulls.createReview({
             owner: deps.ctx.owner,
@@ -275,13 +378,23 @@ The review is anchored at the PR head SHA already loaded in the workspace contex
         } catch (err) {
           gate.release();
           const e = err as { status?: number; message?: string; response?: { data?: { errors?: unknown } } } | null;
+          // The request reached GitHub, and no answer came (the request
+          // bound, or a dropped connection) or GitHub failed on it. GitHub
+          // stops a request after 10 seconds and can make the review
+          // anyway. An error with no status never left the runtime.
+          if (e?.status !== undefined && (!e.response || e.status >= 500)) {
+            unanswered ??= startedAt;
+            const what = e.response ? `GitHub answered ${e.status}` : 'GitHub did not answer';
+            return `ERROR: ${what} (${e.message ?? String(err)}), so the review may have been posted anyway. Call post_review again with the same input: it first looks for this review on the PR, and posts it only if it is not there.`;
+          }
           const errors = e?.response?.data?.errors;
           return `ERROR status=${e?.status ?? '?'}: nothing was posted. ${e?.message ?? String(err)}${errors ? `\n${JSON.stringify(errors)}` : ''}`;
         }
       }
+      unanswered = null;
 
       // A failed state write is only reported; see writeState.
-      const state = await writeState(deps, input.state);
+      const state = await writeState(deps, input.state, heads);
       if (deps.statusComment) {
         const reply = stripStateMarker(input.body).trim()
           || (input.comments.length > 0 ? `Review complete. See the ${input.comments.length} inline comment(s).` : NOTHING_NEW);
@@ -315,14 +428,16 @@ Posts no review, but still writes \`state\` to the PR's review-state comment, so
     inputSchema: z.object({
       reason: z.string().min(1).describe('One-sentence rationale. Logged, and on a mention-triggered run shown to the requester.'),
       state: reviewStateSchema,
+      full_review: fullReviewSchema,
     }),
     callback: async (input) => {
-      const invalid = tooLong('`reason`', input.reason) ?? checkState(deps, input.state);
+      const heads = runHeads(deps, input.full_review);
+      const invalid = tooLong('`reason`', input.reason) ?? checkState(deps, input.state, heads);
       if (invalid) return `ERROR: nothing was posted. ${invalid}`;
       const taken = gate.acquire('skip_review');
       if (taken) return taken;
       // A failed state write is only reported; see writeState.
-      const state = await writeState(deps, input.state);
+      const state = await writeState(deps, input.state, heads);
       // Mention-triggered runs: someone asked and is watching the status
       // comment, and a silent exit would leave it on "still working".
       if (deps.statusComment) {

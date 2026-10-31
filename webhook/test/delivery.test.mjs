@@ -932,3 +932,56 @@ test('a summons on an unrouted repository is skipped', async () => {
   }));
   assert.equal(body(resp).skipped, 'mention:unrouted-repo=someone/else');
 });
+
+const retarget = (updatedAt, pr = {}, repo = REPO) => ({
+  ...prEvent('edited', { updated_at: updatedAt, ...pr }, repo),
+  changes: { base: { ref: { from: 'unstable' }, sha: { from: 'base0' } } },
+});
+const epoch = (iso) => Date.parse(iso) / 1000;
+
+test('a new base branch starts a delayed review of the same head', async () => {
+  const { handler, sent, store, logs } = setup();
+  await handler(delivery('pull_request', prEvent('opened')));
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  const at = '2026-10-30T12:00:00Z';
+  const resp = await handler(delivery('pull_request', retarget(at)));
+  assert.equal(body(resp).enqueued, `${REPO}#7#abc123#base${epoch(at)}`, 'not a duplicate of the review the head already had');
+  assert.deepEqual(sent[1], {
+    queueUrl: 'q-valkey',
+    body: {
+      repo: REPO, pr_number: 7, installation_id: 42, head_sha: 'abc123', run_nonce: `base${epoch(at)}`, pending_marker: 'pending-2',
+      trigger: 'base_changed', skip_drafts: false,
+    },
+    attributes: { repo: REPO, pr_number: 7, action: 'edited' },
+    options: { delaySeconds: 300 },
+  });
+  assert.equal(logs.at(-2), `[auto-review] route=valkey-review repo=${REPO} pr=7 round=2/3 queued delay=300s`);
+});
+
+test('each base change is reviewed once, and a redelivery of one is its duplicate', async () => {
+  const { handler, sent, store } = setup();
+  const first = '2026-10-30T12:00:00Z';
+  assert.equal(body(await handler(delivery('pull_request', retarget(first)))).enqueued, `${REPO}#7#abc123#base${epoch(first)}`);
+  assert.equal(body(await handler(delivery('pull_request', retarget(first)))).skipped, 'duplicate');
+  await store.clearReviewPending(REPO, 7, 'pending-1');
+  const back = '2026-10-30T12:10:00Z';
+  assert.equal(body(await handler(delivery('pull_request', retarget(back)))).enqueued, `${REPO}#7#abc123#base${epoch(back)}`);
+  assert.deepEqual(sent.map((s) => s.body.trigger), ['base_changed', 'base_changed']);
+});
+
+test('an edit that keeps the base branch does not review', async () => {
+  const { handler, sent } = setup();
+  const titleOnly = { ...prEvent('edited', { updated_at: '2026-10-30T12:00:00Z' }), changes: { title: { from: 'Old title' } } };
+  assert.equal(body(await handler(delivery('pull_request', titleOnly))).skipped, 'action=edited');
+  assert.equal(body(await handler(delivery('pull_request', prEvent('edited')))).skipped, 'action=edited');
+  assert.equal(sent.length, 0);
+});
+
+test('a base change follows the route gates of new commits', async () => {
+  const { handler, sent } = setup();
+  const at = '2026-10-30T12:00:00Z';
+  assert.equal(body(await handler(delivery('pull_request', retarget(at, { draft: true }, GLIDE)))).skipped, 'draft');
+  assert.equal(body(await handler(delivery('pull_request', retarget(at, {}, 'example-org/mention-only')))).skipped, 'mention-only-route=mention-only');
+  assert.equal(body(await handler(delivery('pull_request', retarget(at, { user: { login: 'dependabot[bot]', type: 'Bot' } })))).skipped, 'bot-author=dependabot[bot]');
+  assert.equal(sent.length, 0);
+});

@@ -38,15 +38,16 @@ HTTP API -> receiver -+-> route queue -> route worker -> reviewer runtime -> Git
 
 ### Automatic pull request review
 
-1. A pull request on a review route is opened, reopened or gets new
-   commits (`synchronize`), or, on a `skipDrafts` route, is marked ready for
-   review. GitHub sends a `pull_request` delivery to the HTTP API.
+1. A pull request on a review route is opened, reopened, gets new
+   commits (`synchronize`) or a new base branch (`edited`), or, on a
+   `skipDrafts` route, is marked ready for review. GitHub sends a
+   `pull_request` delivery to the HTTP API.
 2. The receiver checks the signature, applies the route's gates, claims the
    idempotency key, takes the pull request's pending marker and one of its
    automatic review rounds, and takes a slot from the route's daily budget
    (`pullRequest` in `webhook/src/delivery.ts`). It sends a review envelope
    (`webhook/src/review-envelope.ts`) to the route's queue, with an SQS
-   delay when new commits started it.
+   delay when new commits or a new base branch started it.
 3. The route's worker waits while another review of the same pull request
    runs, at most until the review's run budget is used up. Then it writes
    the run's start record, removes the pending marker, calls
@@ -159,7 +160,8 @@ which `scripts/dump-hour.sh` summarizes.
 
 - `ping`: answered with 200.
 - `pull_request`: the automatic review path. `opened`, `reopened`,
-  `synchronize` (new commits) and `ready_for_review` can start a review.
+  `synchronize` (new commits), `edited` with a new base branch and
+  `ready_for_review` can start a review.
   `closed`, and `converted_to_draft` on a `skipDrafts` route, never review;
   while a review waits they release the key of a later reopen or
   `ready_for_review` at that head (`pullRequestLeft`), so that event is not
@@ -182,13 +184,14 @@ authors and feedback authors.
 
 In order (`pullRequest`):
 
-1. The action is one of the four above.
+1. The action is one of the five above.
 2. The pull request author is not a bot.
 3. The repository has a review route (case-insensitive).
 4. The route is not `mentionOnly`.
-5. Drafts: on `skipDrafts` routes a draft is skipped when opened or pushed
-   to, and reviewed on `ready_for_review`. Other routes review on open and
-   on new commits, draft or not, and ignore `ready_for_review`.
+5. Drafts: on `skipDrafts` routes a draft is skipped when opened, pushed to
+   or moved to a new base, and reviewed on `ready_for_review`. Other routes
+   review on open, on new commits and on a new base, draft or not, and
+   ignore `ready_for_review`.
 6. When the route's `authorAllowlist` is not empty, the author is on it.
 7. The idempotency key is new.
 8. No other automatic review of the pull request waits: the receiver takes
@@ -202,10 +205,11 @@ In order (`pullRequest`):
 The pending marker, `pending#owner/name#pr`, is a conditional put with a
 random id. The review holds it from step 8 until its worker starts the run,
 so at most one automatic review of a pull request waits at a time. A push,
-reopen or `ready_for_review` while it waits uses no round or budget, and
-the run reviews the head the pull request has when it starts. A review of
-new commits waits in the queue for `PUSH_REVIEW_DELAY_SECONDS` (default 300,
-at most 900), so a burst of pushes becomes one review. The marker expires
+reopen, base change or `ready_for_review` while it waits uses no round or
+budget, and the run reviews the head the pull request has when it starts. A
+review of new commits or of a new base waits in the queue for
+`PUSH_REVIEW_DELAY_SECONDS` (default 300, at most 900), so a burst of pushes,
+or a retarget and the rebase after it, becomes one review. The marker expires
 an hour after that delay, or after the worker's latest extension, in case
 no worker removes it.
 
@@ -289,7 +293,10 @@ takes no slot.
 
 - `owner/name#<pr>#<head sha>` for automatic reviews, with `#reopened`,
   `#ready` or `#push` appended for a reopen, `ready_for_review` and new
-  commits. Each trigger has its own key, so the review one trigger asks
+  commits, and `#base<seconds>` for a new base branch, where `<seconds>` is
+  the pull request's `updated_at` in Unix seconds: the head does not move,
+  so the time of the edit tells two base changes apart. Each trigger
+  has its own key, so the review one trigger asks
   for is never dropped as the duplicate of another trigger's review of the
   same head. The cost: the first reopen at a head that was already
   reviewed reviews it again and uses a round;
@@ -353,7 +360,8 @@ It writes at most once a minute while agent events arrive, writes
 after any write still in flight. The key is
 `owner/name#<pr>#<head sha>`, plus `#<nonce>` when the envelope has one:
 `reopened` for a reopen, `ready` for a draft marked ready, `push` for new
-commits, `m<comment id>` for an @mention run. The nonce keeps a completed
+commits, `base<seconds>` for a new base branch, `m<comment id>` for an
+@mention run. The nonce keeps a completed
 automatic review from making the watchdog drop a later run on the same head.
 `heartbeatRunKey` in `webhook/src/review-envelope.ts` and the run key in
 `run-agent.ts` must produce the same string.
@@ -641,9 +649,16 @@ state are capped at 60,000 characters, and the state must pass
   state comment.
 - `skip_review` writes only the state comment.
 
-A failed review submission gives the gate back. A failed state comment write
-does not: it is reported in the result as `state_comment_error` and the call
-still completes, so a run never ends without a terminal tool because of it.
+A failed review submission gives the gate back. When GitHub answered it with
+a server error, or not at all, the review may be there anyway: GitHub stops a
+request after 10 seconds and can still make the review. The next
+`post_review` then looks for this App's review of the head submitted since
+the failed one started, with the same body and inline comments (GraphQL
+`viewer` gives the bot's id; another run can review the same head), and
+posts only when there is none. An error with no status never left the runtime, so
+nothing was posted. A failed state comment write does not give the gate back:
+it is reported in the result as `state_comment_error` and the call still
+completes, so a run never ends without a terminal tool because of it.
 
 A successful call reports back through `onTerminal`, which is how the run
 knows the review is done. `run-agent.ts` refuses to start the loop if the
@@ -664,12 +679,28 @@ model fills `reviewStateSchema`:
 - `direction`: an alternative approach, or empty.
 
 `validateReviewState` rejects `ready_for_human_review` with open blocking
-findings or a non-empty `direction`, and a `needed` backport with no branches
-or with branches outside the maintained release lines found for this run.
-`renderReviewState` produces the comment, so its shape is the same across runs
-and models. `createStateCommentWriter` edits the previous comment, or creates
-a new one when the old one returns 404 or a 403 that is not rate limiting; a
-retried terminal call edits the comment the run already created.
+findings or a non-empty `direction`, `needs_work` with neither, and a
+`needed` backport with no branches or with branches outside the maintained
+release lines found for this run. `renderReviewState` produces the comment,
+so its shape is the same across runs and models. Its last line is an HTML
+comment that only the runtime writes, after all model text:
+`<!-- valkey-reviewer:heads {"head":...,"base":...,"full_review":...,"full_review_base":...} -->`
+holds the full head SHA, the base branch, the latest head a full review
+covered and the base that review was against. An automatic review is a full review, unless its
+terminal call sets `full_review: false` or the model call limit stopped it.
+An @mention run is one when its terminal call sets `full_review: true` and
+the limit did not stop it. Any other run carries the previous full review
+over, and when that review did not cover this head and base, the footer says
+the run was a partial review and which head, and base if it differs, the last
+full review covered. `full_review` is null when no full review has run.
+Carried over from a comment written before the heads line, it is the
+footer's 10-hex prefix of the head and `full_review_base` is null, which
+matches any base. `fullyReviewed` reads it that way: the head starts with
+`full_review`, and `full_review_base` is null or the base.
+`createStateCommentWriter`
+edits the previous comment, or creates a new one when the old one returns 404
+or a 403 that is not rate limiting; a retried terminal call edits the comment
+the run already created.
 
 ### The status comment on @mention runs
 

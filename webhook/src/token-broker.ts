@@ -1,7 +1,7 @@
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
 import { createAppAuth } from '@octokit/auth-app';
 import { createTokenBroker } from './broker.js';
-import { githubApi } from './github.js';
+import { boundedRequest, githubApi } from './github.js';
 
 /**
  * Token broker for the reviewer runtimes.
@@ -45,7 +45,7 @@ async function privateKey(): Promise<string> {
   return key;
 }
 
-const appAuth = async () => createAppAuth({ appId: APP_ID, privateKey: await privateKey() });
+const appAuth = async () => createAppAuth({ appId: APP_ID, privateKey: await privateKey(), request: boundedRequest() });
 
 export const handler = createTokenBroker({
   allowedRepos: ALLOWED_REPOS,

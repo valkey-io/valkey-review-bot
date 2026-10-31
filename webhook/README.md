@@ -20,17 +20,19 @@ What happens to a delivery:
   `webhook_secret` from the GitHub App secret. On a mismatch the secret is
   fetched again, at most once a minute, so a rotated secret is picked up.
   Payload fields are logged only for verified deliveries.
-- `pull_request` `opened`, `reopened` and `synchronize` (new commits) start
-  an automatic review on a review route. On `skipDrafts` routes a draft is
+- `pull_request` `opened`, `reopened`, `synchronize` (new commits) and
+  `edited` with a new base branch start an automatic review on a review route. On `skipDrafts` routes a draft is
   skipped, pushes to it included, and reviewed on `ready_for_review` instead;
   other routes ignore `ready_for_review`. In order:
   1. the route gates: bot authors, `mentionOnly`, `skipDrafts` and the draft
      state, `authorAllowlist`;
   2. the idempotency key `repo#pr#head_sha`, with `#reopened`, `#ready` or
-     `#push` appended for a reopen, `ready_for_review` and new commits;
+     `#push` appended for a reopen, `ready_for_review` and new commits, and
+     `#base<seconds>` for a base change, which does not move the head, where
+     `<seconds>` is the pull request's `updated_at` in Unix seconds;
   3. the pull request's pending marker, `pending#owner/name#pr`. Every
      automatic review holds it from here until the worker starts the run.
-     While it is held, a push, reopen or `ready_for_review` joins the waiting
+     While it is held, a push, reopen, base change or `ready_for_review` joins the waiting
      review (`skipped:auto-review-pending`) and uses no round or budget: the
      run reviews the head the pull request has when it starts. The marker
      expires an hour after the review's queue delay, or after the worker's
@@ -41,14 +43,14 @@ What happens to a delivery:
      pull request's latest automatic review;
   5. the route's daily budget.
 
-  The review is then sent to the route's queue, a review of new commits with
-  an SQS delay of `PUSH_REVIEW_DELAY_SECONDS`, and logs
+  The review is then sent to the route's queue, a review of new commits or of
+  a base change with an SQS delay of `PUSH_REVIEW_DELAY_SECONDS`, and logs
   `[auto-review] route=<id> repo=<repo> pr=<n> round=<n>/<cap> queued`, plus
-  `delay=<s>s` for new commits. A review that is not sent (cap, budget, a
+  `delay=<s>s` for those. A review that is not sent (cap, budget, a
   failed send) gives back what it took: its key, marker and round. The
   marker and counter keys use the lowercased repository name, as the route
   lookup does. The envelope carries `trigger` (`opened`, `reopened`,
-  `ready_for_review` or `push`) and `skip_drafts`, and the runtime posts
+  `ready_for_review`, `push` or `base_changed`) and `skip_drafts`, and the runtime posts
   nothing when by then the pull request is closed, merged, or a draft on a
   `skipDrafts` route.
 - `closed`, and `converted_to_draft` on a `skipDrafts` route, never start a
@@ -107,7 +109,7 @@ redelivered from the App's advanced settings.
 | `HAIKU_MODEL_ID` | required | Bedrock model for the safety check on @mention instructions. The call times out after 5 seconds; any failure declines the request. |
 | `DAILY_REVIEW_BUDGET` | `40` | Automatic reviews per route per UTC day, reviews of new commits included. `0` pauses automatic reviews. |
 | `MAX_AUTOMATIC_REVIEWS_PER_PR` | `3` | Automatic reviews one pull request can get, counting the first, from 1 to 20. @mentions and thread replies are not counted. |
-| `PUSH_REVIEW_DELAY_SECONDS` | `300` | SQS delay of a review of new commits, from 0 to 900. Pushes during the delay join that review. |
+| `PUSH_REVIEW_DELAY_SECONDS` | `300` | SQS delay of a review of new commits or of a new base branch, from 0 to 900. Pushes and base changes during the delay join that review. |
 | `INSTALLATION_ID` | none | Used only when a delivery carries no `installation.id`. Without either the delivery is rejected. |
 | `KNOWN_BOT_LOGINS` | built-in list | Comma-separated logins never treated as maintainers. A non-empty value replaces the built-in list: `coderabbitai`, `coderabbitai[bot]`, `copilot`, `copilot[bot]`, `github-actions[bot]`, `dependabot[bot]`, `codecov[bot]`, `sonarcloud[bot]`, `deepsource-io-bot`, `sourcery-ai[bot]`. Users of type `Bot`, logins ending in `[bot]` and `BOT_LOGIN` always count as bots. |
 

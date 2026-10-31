@@ -68,7 +68,7 @@ test('the budget admits exactly the daily limit per route', async () => {
 
   const update = ddb.calls.find((c) => c.op === 'UpdateCommand').input;
   assert.match(update.UpdateExpression, /ADD #reviews :one/);
-  assert.equal(update.ConditionExpression, 'attribute_not_exists(#reviews) OR #reviews < :budget');
+  assert.match(update.ConditionExpression, /^\(attribute_not_exists\(#reviews\) OR #reviews < :budget\) AND /);
   assert.equal(update.ExpressionAttributeValues[':budget'], 40);
 });
 
@@ -109,7 +109,7 @@ test('automatic reviews are numbered per pull request up to the cap', async () =
   assert.equal(counter.reviews, 4);
   assert.equal(counter.ttl, Date.parse('2027-04-11T08:00:00Z') / 1000, 'kept for 180 days after the latest');
   const update = ddb.calls.find((c) => c.op === 'UpdateCommand').input;
-  assert.equal(update.ConditionExpression, 'attribute_not_exists(#reviews) OR #reviews < :cap');
+  assert.match(update.ConditionExpression, /^\(attribute_not_exists\(#reviews\) OR #reviews < :cap\) AND /);
   assert.equal(update.ReturnValues, 'UPDATED_NEW');
 });
 
@@ -269,18 +269,20 @@ test('a waiting review\'s round is noted as given back once per marker, until an
   const marker = await store.markReviewPending('o/r', 7, 300);
   assert.equal(await store.markRoundGivenBack('O/R', 7), true);
   assert.equal(await store.markRoundGivenBack('o/r', 7), false, 'once per marker');
-  const update = ddb.calls.findLast((c) => c.op === 'UpdateCommand' && c.input.UpdateExpression === 'SET #r = :true').input;
+  const update = ddb.calls.findLast((c) => c.op === 'UpdateCommand' && c.input.UpdateExpression === 'SET #r = :note').input;
+  const note = update.ExpressionAttributeValues[':note'];
+  assert.match(note, /^[0-9a-f-]{36}$/, 'the note is the call\'s id');
   assert.deepEqual(update, {
     TableName: TABLE,
     Key: { key: 'pending#o/r#7' },
-    UpdateExpression: 'SET #r = :true',
-    ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)',
+    UpdateExpression: 'SET #r = :note',
+    ConditionExpression: 'attribute_exists(#m) AND #ttl >= :now AND (attribute_not_exists(#r) OR #r = :note)',
     ExpressionAttributeNames: { '#m': 'marker', '#ttl': 'ttl', '#r': 'roundGivenBack' },
-    ExpressionAttributeValues: { ':true': true, ':now': Date.parse('2026-10-13T08:00:00Z') / 1000 },
+    ExpressionAttributeValues: { ':note': note, ':now': Date.parse('2026-10-13T08:00:00Z') / 1000 },
   });
   // The worker keeps its marker while it waits; the note stays with it.
   assert.equal(await extendPendingReview(ddb, TABLE, 'o/r', 7, marker), true);
-  assert.equal(ddb.items.get('pending#o/r#7').roundGivenBack, true);
+  assert.equal(typeof ddb.items.get('pending#o/r#7').roundGivenBack, 'string');
 
   assert.equal(await store.clearRoundGivenBack('O/R', 7), true, 'the pull request is back');
   assert.equal(await store.clearRoundGivenBack('o/r', 7), false, 'only once');
@@ -310,4 +312,45 @@ test('releaseQuietly logs a failed release instead of throwing', async () => {
     console.error = original;
   }
   assert.match(errors[0], /could not release k/);
+});
+
+/**
+ * A client whose every write reaches the table but loses its answer, so
+ * the SDK sends it again: the result is that of the second attempt, as
+ * when a timed-out first attempt was applied.
+ */
+function appliedThenRetried(ddb) {
+  return {
+    async send(command) {
+      if (command.constructor.name === 'GetCommand') return ddb.send(command);
+      await ddb.send(command);
+      return ddb.send(command);
+    },
+  };
+}
+
+test('a retried write that was applied the first time keeps its result', async () => {
+  const ddb = fakeDdb();
+  const store = createDeliveryStore(appliedThenRetried(ddb), TABLE, at('2026-10-13T08:00:00Z'));
+  assert.equal(await store.claim('o/r#1#abc', { action: 'opened' }), true, 'not a duplicate of itself');
+  assert.equal(await createDeliveryStore(ddb, TABLE).claim('o/r#1#abc'), false, 'another delivery still is');
+
+  const marker = await store.markReviewPending('o/r', 1, 300);
+  assert.equal(marker, ddb.items.get(pendingReviewKey('o/r', 1)).marker, 'its own marker, not a review already waiting');
+
+  assert.equal(await store.takeAutoReview('o/r', 1, 3), 1, 'one round, counted once');
+  assert.equal(ddb.items.get(autoReviewKey('o/r', 1)).reviews, 1);
+  assert.equal(await store.takeAutoReview('o/r', 2, 1), 1, 'the last round is taken, not refused');
+
+  assert.equal(await store.takeReviewSlot('valkey-review', 1), true, 'the last slot is taken, not refused');
+  assert.equal(ddb.items.get(budgetKey('valkey-review', new Date('2026-10-13T08:00:00Z'))).reviews, 1);
+
+  await store.takeAutoReview('o/r', 1, 3);
+  await store.returnAutoReview('o/r', 1);
+  assert.equal(ddb.items.get(autoReviewKey('o/r', 1)).reviews, 1, 'one round given back, not two');
+
+  assert.equal(await store.markRoundGivenBack('o/r', 1), true, 'the note is made, so the round is given back');
+  assert.equal(await store.clearRoundGivenBack('o/r', 1), true, 'the note is removed, so the round is taken again');
+  assert.equal(ddb.items.get(pendingReviewKey('o/r', 1)).roundGivenBack, undefined);
+  assert.equal(await createDeliveryStore(ddb, TABLE).clearRoundGivenBack('o/r', 1), false, 'another call finds no note');
 });

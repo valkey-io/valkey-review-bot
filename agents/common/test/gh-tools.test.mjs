@@ -5,10 +5,14 @@ import './support/ts-resolve.mjs';
 const { buildPostReviewTool, buildSkipTool, checkGhApiPath, createTerminalGate, isTerminalCallbackWired, MAX_GITHUB_TEXT_CHARS } = await import('../src/tools/gh.ts');
 
 const ctx = {
-  owner: 'valkey-io', repo: 'valkey', prNumber: 7, headSha: 'abc123',
+  owner: 'valkey-io', repo: 'valkey', prNumber: 7, headSha: 'abc123', baseRef: 'unstable', trigger: 'opened',
+  previousState: null,
   upstreamRepo: 'valkey-io/valkey',
   releaseLines: [{ branch: '9.0', lastCommit: '2026-09-01' }, { branch: '8.1', lastCommit: '2026-08-01' }],
 };
+
+/** This App's bot account, as GraphQL `viewer` names it. */
+const BOT_ID = 282604435;
 
 const state = (overrides = {}) => ({
   status: 'needs_work',
@@ -21,20 +25,25 @@ const state = (overrides = {}) => ({
   ...overrides,
 });
 
-function harness({ createReview, stateWrite, statusComment } = {}) {
+function harness({ createReview, stateWrite, statusComment, graphql, listReviews, reviewComments, callLimitReached, ctx: ctxOverrides } = {}) {
   const reviews = [];
   const stateBodies = [];
   const terminal = [];
   const deps = {
-    ctx,
+    ctx: { ...ctx, ...ctxOverrides },
     tokens: { get: async () => 'token' },
+    callLimitReached,
     octokit: {
       pulls: {
         createReview: createReview ?? (async (args) => {
           reviews.push(args);
           return { data: { id: reviews.length, html_url: `https://github.com/r/${reviews.length}` } };
         }),
+        listReviews: listReviews ?? (async () => { throw new Error('this test reads no reviews'); }),
+        listCommentsForReview: async ({ review_id }) => (reviewComments ?? (() => [comment]))(review_id),
       },
+      paginate: async (method, args) => method(args),
+      graphql: graphql ?? (async () => { throw new Error('this test makes no GraphQL call'); }),
     },
     stateWriter: {
       write: stateWrite ?? (async (body) => {
@@ -245,4 +254,171 @@ test('gh_api_read paths must name an allowed repository and endpoint', () => {
   assert.match(checkGhApiPath('repos/valkey-io/valkey/actions/secrets', repos), /not on the allowlist/);
   assert.match(checkGhApiPath('user/repos', repos), /must start with repos/);
   assert.match(checkGhApiPath('repos/{owner}/{repo}/pulls/1', repos), /only these repositories/);
+});
+
+/** GraphQL for the review lookup: the token's account is the bot. */
+const viewerApi = async (query) => {
+  if (query.includes('viewer')) return { viewer: { databaseId: BOT_ID } };
+  throw new Error(`unexpected query ${query}`);
+};
+
+const posted = (overrides = {}) => ({
+  id: 77, user: { id: BOT_ID }, commit_id: 'abc123', submitted_at: new Date().toISOString().replace(/\.\d+Z$/, 'Z'),
+  html_url: 'https://github.com/r/77', ...overrides,
+});
+
+test('a review GitHub answered 5xx for, or did not answer, is looked for before it is posted again', async () => {
+  for (const failure of [
+    Object.assign(new Error('Server Error'), { status: 502, response: { data: {} } }),
+    Object.assign(new Error('The operation was aborted due to timeout'), { status: 500 }),
+  ]) {
+    let calls = 0;
+    const h = harness({
+      createReview: async () => { calls++; throw failure; },
+      graphql: viewerApi,
+      listReviews: async () => [
+        posted({ id: 70, user: { id: 999 } }),
+        posted({ id: 71, commit_id: 'old' }),
+        posted({ id: 72, submitted_at: '2020-01-01T00:00:00Z' }),
+        posted(),
+      ],
+    });
+    const failed = await h.post.invoke({ body: '', comments: [comment], state: state() });
+    assert.match(failed, /^ERROR: GitHub (answered 502|did not answer) \(.+\), so the review may have been posted anyway\. Call post_review again with the same input/);
+    assert.doesNotMatch(failed, /nothing was posted/);
+    assert.equal(h.terminal.length, 0);
+
+    const result = JSON.parse(await h.post.invoke({ body: '', comments: [comment], state: state() }));
+    assert.equal(calls, 1, 'not posted twice');
+    assert.equal(result.review_id, 77);
+    assert.equal(result.url, 'https://github.com/r/77');
+    assert.equal(h.stateBodies.length, 1);
+    assert.deepEqual(h.terminal.map((t) => t.tool), ['post_review']);
+  }
+});
+
+test('another run\'s review of the same head is not taken for the one that got no answer', async () => {
+  let fail = true;
+  let looked = 0;
+  const reviews = [];
+  const h = harness({
+    createReview: async (args) => {
+      if (fail) throw Object.assign(new Error('Server Error'), { status: 502, response: { data: {} } });
+      reviews.push(args);
+      return { data: { id: 6, html_url: 'https://github.com/r/6' } };
+    },
+    graphql: viewerApi,
+    listReviews: async () => { looked++; return [posted({ id: 500 })]; },
+    reviewComments: (id) => (id === 500 ? [{ path: 'src/other.c', body: 'From a mention run.' }] : []),
+  });
+  await h.post.invoke({ body: '', comments: [comment], state: state() });
+  fail = false;
+  const result = JSON.parse(await h.post.invoke({ body: '', comments: [comment], state: state() }));
+  assert.equal(looked, 1, 'looked for it first');
+  assert.equal(reviews.length, 1, 'this run\'s review is posted');
+  assert.equal(result.review_id, 6);
+});
+
+test('a review that is not on the PR after a lost answer is posted on the next call', async () => {
+  let fail = true;
+  let looked = 0;
+  const reviews = [];
+  const h = harness({
+    createReview: async (args) => {
+      if (fail) throw Object.assign(new Error('Server Error'), { status: 504, response: { data: {} } });
+      reviews.push(args);
+      return { data: { id: 5, html_url: 'https://github.com/r/5' } };
+    },
+    graphql: viewerApi,
+    listReviews: async () => { looked++; return [posted({ user: { id: 999 } })]; },
+  });
+  await h.post.invoke({ body: '', comments: [comment], state: state() });
+  fail = false;
+  const result = JSON.parse(await h.post.invoke({ body: '', comments: [comment], state: state() }));
+  assert.equal(looked, 1, 'looked for it first');
+  assert.equal(reviews.length, 1);
+  assert.equal(result.review_id, 5);
+});
+
+test('a review submission that never left, or a failed lookup, posts nothing', async () => {
+  const neverSent = harness({ createReview: async () => { throw new Error('token broker failed (Unhandled)'); } });
+  assert.match(await neverSent.post.invoke({ body: '', comments: [comment], state: state() }), /^ERROR status=\?: nothing was posted\. token broker failed/);
+
+  let calls = 0;
+  const lookupFails = harness({
+    createReview: async () => { calls++; throw Object.assign(new Error('Server Error'), { status: 502, response: { data: {} } }); },
+    graphql: viewerApi,
+    listReviews: async () => { throw new Error('secondary rate limit'); },
+  });
+  await lookupFails.post.invoke({ body: '', comments: [comment], state: state() });
+  const second = await lookupFails.post.invoke({ body: '', comments: [comment], state: state() });
+  assert.match(second, /^ERROR: nothing was posted\. An earlier post_review may have posted the review, and checking for it failed: secondary rate limit/);
+  assert.equal(calls, 1);
+  assert.equal(lookupFails.terminal.length, 0);
+});
+
+test('on mention runs a review found after a lost answer still gets the reply', async () => {
+  const finished = [];
+  const h = harness({
+    createReview: async () => { throw Object.assign(new Error('Server Error'), { status: 502, response: { data: {} } }); },
+    graphql: viewerApi,
+    listReviews: async () => [posted()],
+    statusComment: { finish: async (text) => { finished.push(text); }, note: () => {} },
+  });
+  await h.post.invoke({ body: 'Yes: buf leaks when read fails.', comments: [comment], state: state() });
+  await h.post.invoke({ body: 'Yes: buf leaks when read fails.', comments: [comment], state: state() });
+  assert.equal(finished.length, 1);
+  assert.match(finished[0], /^Yes: buf leaks when read fails\./);
+});
+
+const HEAD = 'abcdef0123456789abcdef0123456789abcdef01';
+const OLD = '1111111111222222222233333333334444444444';
+const headsOf = (body) => JSON.parse(body.split('\n').at(-1).replace('<!-- valkey-reviewer:heads ', '').replace(' -->', ''));
+const headsComment = (heads) => ({ id: 5, body: `old\n<!-- valkey-reviewer:heads ${JSON.stringify(heads)} -->` });
+
+test('the state records the head and base a full review last covered', async () => {
+  const previousState = headsComment({ head: OLD, base: 'unstable', full_review: OLD, full_review_base: 'unstable' });
+
+  const automatic = harness({ ctx: { headSha: HEAD, trigger: 'push', previousState } });
+  await automatic.skip.invoke({ reason: 'r', state: state() });
+  assert.deepEqual(headsOf(automatic.stateBodies[0]), { head: HEAD, base: 'unstable', full_review: HEAD, full_review_base: 'unstable' });
+  assert.doesNotMatch(automatic.stateBodies[0], /partial/);
+
+  const focused = harness({ ctx: { headSha: HEAD, trigger: null, previousState } });
+  await focused.skip.invoke({ reason: 'r', state: state() });
+  assert.deepEqual(headsOf(focused.stateBodies[0]), { head: HEAD, base: 'unstable', full_review: OLD, full_review_base: 'unstable' });
+  assert.match(focused.stateBodies[0], /after a partial review; the last full review was at 1111111111\./);
+
+  const summonedFull = harness({ ctx: { headSha: HEAD, trigger: null, previousState } });
+  await summonedFull.post.invoke({ body: 'Reviewed it all.', comments: [], state: state(), full_review: true });
+  assert.equal(headsOf(summonedFull.stateBodies[0]).full_review, HEAD);
+
+  const first = harness({ ctx: { headSha: HEAD, trigger: null, previousState: null } });
+  await first.skip.invoke({ reason: 'r', state: state(), full_review: false });
+  assert.deepEqual(headsOf(first.stateBodies[0]), { head: HEAD, base: 'unstable', full_review: null, full_review_base: null });
+  assert.match(first.stateBodies[0], /no full review has run yet/);
+});
+
+test('a focused run after a new base does not pass for a full review against it', async () => {
+  const previousState = headsComment({ head: HEAD, base: 'unstable', full_review: HEAD, full_review_base: 'unstable' });
+  const h = harness({ ctx: { headSha: HEAD, baseRef: '9.0', trigger: null, previousState } });
+  await h.skip.invoke({ reason: 'r', state: state() });
+  assert.deepEqual(headsOf(h.stateBodies[0]), { head: HEAD, base: '9.0', full_review: HEAD, full_review_base: 'unstable' });
+  assert.match(h.stateBodies[0], /after a partial review; the last full review was at abcdef0123 against `unstable`\./);
+
+  const automatic = harness({ ctx: { headSha: HEAD, baseRef: '9.0', trigger: 'base_changed', previousState } });
+  await automatic.skip.invoke({ reason: 'r', state: state() });
+  assert.deepEqual(headsOf(automatic.stateBodies[0]), { head: HEAD, base: '9.0', full_review: HEAD, full_review_base: '9.0' });
+});
+
+test('an automatic review the call limit stopped, or the model says it did not finish, is recorded as partial', async () => {
+  const previousState = headsComment({ head: OLD, base: 'unstable', full_review: OLD, full_review_base: 'unstable' });
+  const stopped = harness({ ctx: { headSha: HEAD, trigger: 'push', previousState }, callLimitReached: () => true });
+  await stopped.skip.invoke({ reason: 'r', state: state(), full_review: true });
+  assert.equal(headsOf(stopped.stateBodies[0]).full_review, OLD, 'the runtime knows better than the model');
+  assert.match(stopped.stateBodies[0], /after a partial review; the last full review was at 1111111111\./);
+
+  const unfinished = harness({ ctx: { headSha: HEAD, trigger: 'push', previousState }, callLimitReached: () => false });
+  await unfinished.skip.invoke({ reason: 'r', state: state(), full_review: false });
+  assert.equal(headsOf(unfinished.stateBodies[0]).full_review, OLD);
 });

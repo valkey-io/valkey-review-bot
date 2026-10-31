@@ -1,6 +1,6 @@
 import { GetSecretValueCommand, SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
 import { createAppAuth } from '@octokit/auth-app';
-import { createAppSecretSource, fetchRepoInstallation, githubApi, type GitHubApi } from './github.js';
+import { boundedRequest, createAppSecretSource, fetchRepoInstallation, githubApi, type GitHubApi } from './github.js';
 
 /**
  * Skills-repo token broker.
@@ -112,7 +112,7 @@ export function skillsRepoBrokerFromEnv(
   const appAuth = async () => {
     const { appId, privateKey } = await secrets.get();
     if (!appId || !privateKey) throw new Error('skills-repo App secret has no app_id or private_key');
-    return createAuth({ appId, privateKey });
+    return createAuth({ appId, privateKey, request: boundedRequest() });
   };
   return createSkillsRepoBroker({
     repo,

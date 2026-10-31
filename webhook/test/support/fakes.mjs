@@ -6,6 +6,19 @@ export function conditionFailed() {
   return Object.assign(new Error('The conditional request failed'), { name: 'ConditionalCheckFailedException' });
 }
 
+/** An item as DynamoDB returns it in an error: typed values, which the document client leaves as they are. */
+function typedItem(item) {
+  return Object.fromEntries(Object.entries(item).map(([k, v]) => [k,
+    typeof v === 'number' ? { N: String(v) } : typeof v === 'boolean' ? { BOOL: v } : { S: String(v) }]));
+}
+
+/** The failure for `input`, carrying the item it found when the call asked for it. */
+function conditionFailedOn(input, item) {
+  const err = conditionFailed();
+  if (input.ReturnValuesOnConditionCheckFailure === 'ALL_OLD' && item) err.Item = typedItem(item);
+  return err;
+}
+
 /**
  * An in-memory DynamoDB document client for the receiver's table. It
  * understands the commands src/store.ts sends, including the conditions
@@ -25,9 +38,9 @@ export function fakeDdb() {
       if (op === 'PutCommand') {
         const existing = items.get(input.Item.key);
         if (input.ConditionExpression === 'attribute_not_exists(#k)') {
-          if (existing) throw conditionFailed();
+          if (existing) throw conditionFailedOn(input, existing);
         } else if (input.ConditionExpression === 'attribute_not_exists(#k) OR #ttl < :now') {
-          if (existing && !(existing.ttl < input.ExpressionAttributeValues[':now'])) throw conditionFailed();
+          if (existing && !(existing.ttl < input.ExpressionAttributeValues[':now'])) throw conditionFailedOn(input, existing);
         } else {
           throw new Error(`unexpected condition ${input.ConditionExpression}`);
         }
@@ -54,34 +67,43 @@ export function fakeDdb() {
         item.ttl = input.ExpressionAttributeValues[':ttl'];
         return {};
       }
-      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#m) AND #ttl >= :now AND attribute_not_exists(#r)') {
+      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#m) AND #ttl >= :now AND (attribute_not_exists(#r) OR #r = :note)') {
         const item = items.get(input.Key.key);
-        if (!item?.marker || !(item.ttl >= input.ExpressionAttributeValues[':now']) || item.roundGivenBack !== undefined) throw conditionFailed();
-        if (input.UpdateExpression !== 'SET #r = :true' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack') throw new Error(`unexpected update ${input.UpdateExpression}`);
-        item.roundGivenBack = input.ExpressionAttributeValues[':true'];
+        const note = input.ExpressionAttributeValues[':note'];
+        if (!item?.marker || !(item.ttl >= input.ExpressionAttributeValues[':now'])) throw conditionFailed();
+        if (item.roundGivenBack !== undefined && item.roundGivenBack !== note) throw conditionFailed();
+        if (input.UpdateExpression !== 'SET #r = :note' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack') throw new Error(`unexpected update ${input.UpdateExpression}`);
+        item.roundGivenBack = note;
         return {};
       }
-      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#r)') {
+      if (op === 'UpdateCommand' && input.ConditionExpression === 'attribute_exists(#r) OR #c = :clear') {
         const item = items.get(input.Key.key);
-        if (item?.roundGivenBack === undefined) throw conditionFailed();
-        if (input.UpdateExpression !== 'REMOVE #r' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack') throw new Error(`unexpected update ${input.UpdateExpression}`);
+        const clear = input.ExpressionAttributeValues[':clear'];
+        if (item?.roundGivenBack === undefined && item?.noteCleared !== clear) throw conditionFailed();
+        if (input.UpdateExpression !== 'SET #c = :clear REMOVE #r' || input.ExpressionAttributeNames['#r'] !== 'roundGivenBack' || input.ExpressionAttributeNames['#c'] !== 'noteCleared') {
+          throw new Error(`unexpected update ${input.UpdateExpression}`);
+        }
         delete item.roundGivenBack;
+        item.noteCleared = clear;
         return {};
       }
       if (op === 'UpdateCommand') {
         const item = items.get(input.Key.key) ?? { key: input.Key.key };
         const values = input.ExpressionAttributeValues;
-        const below = /^attribute_not_exists\(#reviews\) OR #reviews < (:\w+)$/.exec(input.ConditionExpression);
+        const below = /^\(attribute_not_exists\(#reviews\) OR #reviews < (:\w+)\) AND \(attribute_not_exists\(#take\) OR #take <> :take\)$/.exec(input.ConditionExpression);
         if (below) {
-          if (item.reviews !== undefined && !(item.reviews < values[below[1]])) throw conditionFailed();
-        } else if (input.ConditionExpression === '#reviews > :zero') {
-          if (!(item.reviews > values[':zero'])) throw conditionFailed();
+          if (item.reviews !== undefined && !(item.reviews < values[below[1]])) throw conditionFailedOn(input, items.get(input.Key.key));
+          if (item.lastTake !== undefined && item.lastTake === values[':take']) throw conditionFailedOn(input, items.get(input.Key.key));
+        } else if (input.ConditionExpression === '#reviews > :zero AND (attribute_not_exists(#return) OR #return <> :return)') {
+          if (!(item.reviews > values[':zero']) || item.lastReturn === values[':return']) throw conditionFailed();
         } else {
           throw new Error(`unexpected condition ${input.ConditionExpression}`);
         }
         const add = /ADD #reviews (:\w+)/.exec(input.UpdateExpression);
         item.reviews = (item.reviews ?? 0) + values[add[1]];
         if (/SET #ttl = :ttl/.test(input.UpdateExpression)) item.ttl = values[':ttl'];
+        if (/#take = :take/.test(input.UpdateExpression)) item.lastTake = values[':take'];
+        if (/#return = :return/.test(input.UpdateExpression)) item.lastReturn = values[':return'];
         items.set(input.Key.key, item);
         return input.ReturnValues === 'UPDATED_NEW' ? { Attributes: { reviews: item.reviews, ttl: item.ttl } } : {};
       }

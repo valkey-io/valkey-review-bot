@@ -24,8 +24,9 @@ The reviewer runs as a GitHub App. On the Valkey repositories it appears as
 
 ## How to use it
 
-- **Automatic reviews** run when a pull request is opened or reopened and when new
-  commits are pushed to it, within a daily budget per repository. A pull request gets at
+- **Automatic reviews** run when a pull request is opened or reopened, when new
+  commits are pushed to it and when its base branch changes, within a daily budget per
+  repository. A pull request gets at
   most 3 automatic reviews, counting the first (the deployment can set 1 to 20). A
   review still waiting to start when the pull request is closed, or turned back into a
   draft on a repository that skips drafts, gives its round back; it takes the round
