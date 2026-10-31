@@ -363,6 +363,20 @@ test('a thread reply in a thread this App started is answered against its commen
   assert.equal(envelope.run_nonce, 'm202');
 });
 
+test('a thread reply names the line the comment was posted on, as the review state records it, and where it is now', async () => {
+  const m = detectMention('pull_request_review_comment', reviewComment('@example-reviewer fixed', { in_reply_to_id: 150 }), opts);
+  const parent = (line, original) => ({
+    status: 200,
+    json: { body: 'This leaks the buffer.', user: { login: BOT, type: 'Bot' }, path: 'src/networking.c', line, original_line: original },
+  });
+  const moved = mentionDeps(threadReplyGitHub(BOT, { [`GET repos/${REPO}/pulls/comments/150`]: parent(4790, 4778) }));
+  await handleMention(m, target, moved.deps);
+  assert.match(moved.enqueued[0].instruction, /comment on "src\/networking\.c" line 4778 \(now line 4790\):/);
+  const outdated = mentionDeps(threadReplyGitHub(BOT, { [`GET repos/${REPO}/pulls/comments/150`]: parent(null, 4778) }));
+  await handleMention(m, target, outdated.deps);
+  assert.match(outdated.enqueued[0].instruction, /comment on "src\/networking\.c" line 4778:/);
+});
+
 test('the thread-reply instruction covers fix claims, disputes and questions', async () => {
   const replies = [
     'fixed, please re-check',

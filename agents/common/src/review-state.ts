@@ -35,7 +35,7 @@ export const reviewStateSchema = z.object({
   risk: z.enum(['low', 'medium', 'high']).describe('Risk of merging the PR as it stands at this head.'),
   risk_reason: z.string().min(1).describe('One short sentence: what breaks, and for whom, if this change is wrong.'),
   findings: z.array(z.object({
-    location: z.string().describe('`path:line`, or "" for a PR-wide finding.'),
+    location: z.string().describe('`path:line`, the line its inline comment was posted at (the last line of a multi-line comment), or "" for a PR-wide finding.'),
     summary: z.string().min(1).describe('The finding in one short sentence.'),
     blocking: z.boolean().describe('true if this must be fixed before merge.'),
     resolved: z.boolean().describe('true only if the finding is fixed at the current head, checked there. A finding shown to be wrong is not resolved: drop it from the list.'),
@@ -104,6 +104,43 @@ function findingLine(f: ReviewState['findings'][number]): string {
 }
 
 /**
+ * A finding location as a `path:line` key, or null when it names no
+ * single line. It is folded and its backticks replaced as the comment
+ * shows it, so a location read back from a state comment gives the same
+ * key.
+ */
+export function locationKey(location: string): string | null {
+  const m = /^(.+):(\d+)$/.exec(oneLine(location).replace(/`/g, "'"));
+  return m ? `${m[1]}:${Number(m[2])}` : null;
+}
+
+/**
+ * Keys of the open findings a state comment records. The heads line
+ * lists them. A comment from before that list existed is read from its
+ * open findings: one per line, the location in the code span that starts
+ * the line. Model text can pass for such a line there (a PR-wide
+ * finding's summary that starts with a code span, or a summary that
+ * holds the heading), which the heads line rules out.
+ */
+export function openFindingKeys(body: string): Set<string> {
+  const recorded = headsJson(body)?.open_locations;
+  if (Array.isArray(recorded) && recorded.every((k) => typeof k === 'string')) {
+    return new Set(recorded.map((k: string) => locationKey(k)).filter((k): k is string => k !== null));
+  }
+  const keys = new Set<string>();
+  const lines = body.split(/\r?\n/);
+  const start = lines.findIndex((l) => /^\*\*Open findings \(\d+\)\*\*$/.test(l));
+  if (start === -1) return keys;
+  for (const line of lines.slice(start + 1)) {
+    if (!line.startsWith('- ')) break;
+    const m = /^- (?:\(minor\) )?`([^`]*)` /.exec(line);
+    const key = m ? locationKey(m[1]!) : null;
+    if (key) keys.add(key);
+  }
+  return keys;
+}
+
+/**
  * What a state comment was written for. `head` is the PR head the run
  * saw and `base` the branch it reviewed against. `fullReview` is the
  * latest head a full review covered and `fullReviewBase` the base that
@@ -137,18 +174,21 @@ export function fullyReviewed(heads: ReviewHeads): boolean {
 }
 
 /**
- * The comment's last line: `heads` as JSON inside an HTML comment, which
+ * The comment's last line: `heads`, and the `path:line` keys of the open
+ * findings that name a line, as JSON inside an HTML comment, which
  * GitHub does not show. Only the runtime writes it, after all model
  * text, so a reader that takes only the last line cannot be handed a
  * line the model wrote. `<` and `>` are escaped, so no value can end the
  * HTML comment early.
  */
-function headsLine(heads: ReviewHeads): string {
+function headsLine(heads: ReviewHeads, state: ReviewState): string {
+  const open = state.findings.filter((f) => !f.resolved).map((f) => locationKey(f.location)).filter((k) => k !== null);
   const json = JSON.stringify({
     head: heads.head,
     base: heads.base,
     full_review: heads.fullReview,
     full_review_base: heads.fullReviewBase,
+    open_locations: [...new Set(open)],
   }).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
   return `${HEADS_PREFIX}${json}${HEADS_SUFFIX}`;
 }
@@ -250,7 +290,7 @@ export function renderReviewState(state: ReviewState, heads: ReviewHeads, now: D
   const stamp = now.toISOString().slice(0, 16).replace('T', ' ');
   const headSha = heads.head;
   lines.push(`<sub>Updated for ${headSha.slice(0, 10)} at ${stamp} UTC${coverageNote(heads)}. The bot rewrites this comment on every review.</sub>`);
-  lines.push(headsLine(heads));
+  lines.push(headsLine(heads, state));
   return lines.join('\n');
 }
 
@@ -261,7 +301,8 @@ export function renderReviewState(state: ReviewState, heads: ReviewHeads, now: D
  * second one.
  */
 export interface StateCommentWriter {
-  write(body: string): Promise<{ id: number; url: string }>;
+  /** `userId` is the comment's author, this App's bot account, when GitHub returned it. */
+  write(body: string): Promise<{ id: number; url: string; userId: number | null }>;
 }
 
 interface RequestErrorFields {
@@ -295,7 +336,7 @@ export function createStateCommentWriter(octokit: Octokit, ctx: PrContext): Stat
           const { data } = await octokit.issues.updateComment({
             owner: ctx.owner, repo: ctx.repo, comment_id: commentId, body,
           });
-          return { id: data.id, url: data.html_url };
+          return { id: data.id, url: data.html_url, userId: data.user?.id ?? null };
         } catch (err) {
           if (!isGone(err)) throw err;
           console.warn(`[review-state] state comment ${commentId} cannot be edited (status ${(err as { status: number }).status}); creating a new one`);
@@ -305,7 +346,7 @@ export function createStateCommentWriter(octokit: Octokit, ctx: PrContext): Stat
         owner: ctx.owner, repo: ctx.repo, issue_number: ctx.prNumber, body,
       });
       commentId = data.id;
-      return { id: data.id, url: data.html_url };
+      return { id: data.id, url: data.html_url, userId: data.user?.id ?? null };
     },
   };
 }

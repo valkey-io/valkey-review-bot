@@ -564,3 +564,61 @@ test('a failed start claim leaves the message and its marker for a retry', async
   assert.deepEqual(ops(), ['GetCommand idempotency', 'ScanCommand heartbeat', 'UpdateCommand heartbeat'], 'no delete, no invoke');
   assert.ok(lines.some((l) => /^\[fail\] messageId=m1: throttled$/.test(l)), lines.join('\n'));
 });
+
+test('a review run gets a grant for its own pull request, stored hashed; curator runs and failed writes get none', async () => {
+  const { createHash } = await import('node:crypto');
+  const { grantFromItem } = await import('../src/resolve-grant.ts');
+  const saved = process.env.THREAD_RESOLVER_FUNCTION;
+  process.env.THREAD_RESOLVER_FUNCTION = 'thread-resolver';
+  try {
+    const { handler: withResolver } = await import(`../src/invoker.ts?resolver`);
+    let putError;
+    const base = tables({});
+    ddbAnswer = async (command) => {
+      if (command.constructor.name !== 'PutCommand') return base(command);
+      if (putError) throw putError;
+      return {};
+    };
+    const go = async (envelope) => capture(() => withResolver(sqsEvent(envelope)));
+
+    await go(mention);
+    const put = calls.find((c) => c.op === 'PutCommand').input;
+    const sent = invoked().thread_resolver;
+    assert.equal(sent.function_name, 'thread-resolver');
+    assert.match(sent.grant, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(put.TableName, 'idempotency');
+    assert.equal(put.Item.key, `resolve#${createHash('sha256').update(sent.grant).digest('hex')}`);
+    assert.deepEqual([put.Item.repo, put.Item.pr_number, put.Item.installation_id], ['Example-Org/Valkey', 7, 42]);
+    assert.ok(Math.abs(put.Item.ttl - (Math.floor(Date.now() / 1000) + 2 * 3600)) < 60, 'as long as the session can live');
+    assert.equal(put.ConditionExpression, 'attribute_not_exists(#k)');
+    assert.ok(!JSON.stringify(put).includes(sent.grant), 'the table holds only its hash');
+    assert.deepEqual(grantFromItem(put.Item), { repo: 'Example-Org/Valkey', prNumber: 7, installationId: 42, expiresAt: put.Item.ttl }, 'what the resolver reads back');
+    assert.deepEqual(ops(), ['UpdateCommand heartbeat', 'PutCommand idempotency', 'InvokeAgentRuntimeCommand']);
+
+    await go(mention);
+    assert.notEqual(invoked().thread_resolver.grant, sent.grant, 'every run gets its own');
+
+    await go({ maintenance_id: 'check#valkey-review#r1#2026-10-13', reviewer_id: 'valkey-review' });
+    assert.deepEqual(ops(), ['InvokeAgentRuntimeCommand']);
+    assert.equal(invoked().thread_resolver, undefined);
+    // Curator feedback names a pull request too, and still gets no grant.
+    await go({ feedback_id: 'f1', repo: 'Example-Org/Valkey', pr_number: 7, installation_id: 42 });
+    assert.equal(calls.some((c) => c.op === 'PutCommand'), false);
+    assert.equal(invoked().thread_resolver, undefined);
+
+    putError = new Error('throttled');
+    const { lines } = await go(mention);
+    assert.equal(invoked().thread_resolver, undefined);
+    assert.ok(lines.some((l) => /could not write the resolve grant; the run leaves its threads open/.test(l)));
+  } finally {
+    if (saved === undefined) delete process.env.THREAD_RESOLVER_FUNCTION;
+    else process.env.THREAD_RESOLVER_FUNCTION = saved;
+  }
+});
+
+test('a review worker without the resolver says the run gets no grant', async () => {
+  ddbAnswer = tables({});
+  const { lines } = await run(sqsEvent(mention));
+  assert.equal(invoked().thread_resolver, undefined);
+  assert.ok(lines.some((l) => /THREAD_RESOLVER_FUNCTION or IDEMPOTENCY_TABLE is not set; the run gets no resolve grant/.test(l)));
+});

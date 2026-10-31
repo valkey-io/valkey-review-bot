@@ -481,7 +481,7 @@ describe('webhook', () => {
     return statementsForRole(t, roleOfFunction(t, id));
   };
 
-  test('review workers may read, extend and delete pending markers, and no other idempotency item', () => {
+  test('review workers may read, extend and delete pending markers and write resolve grants, and no other idempotency item', () => {
     expect(reviewWorkers()).toHaveLength(s.config.routes.length);
     const t = s.template(s.stacks.webhook);
     for (const id of reviewWorkers()) {
@@ -494,8 +494,49 @@ describe('webhook', () => {
         Action: ['dynamodb:DeleteItem', 'dynamodb:GetItem', 'dynamodb:UpdateItem'],
         Resource: { 'Fn::GetAtt': [idempotencyId(), 'Arn'] },
         Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['pending#*'] } },
+      }, {
+        Sid: 'ResolveGrants',
+        Effect: 'Allow',
+        Action: 'dynamodb:PutItem',
+        Resource: { 'Fn::GetAtt': [idempotencyId(), 'Arn'] },
+        Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['resolve#*'] } },
       }]);
     }
+  });
+
+  test('the thread resolver reads the App key and only resolve grants, and only the reviewer runtimes may call it', () => {
+    const t = s.template(s.stacks.webhook);
+    const [resolverId] = functionIds(t, 'ThreadResolverFn');
+    expect(resolverId).toBeDefined();
+    const env = functionEnv(t, 'ThreadResolverFn');
+    expect(Object.keys(env).sort()).toEqual(['GITHUB_SECRET_ARN', 'IDEMPOTENCY_TABLE']);
+    expect(env.IDEMPOTENCY_TABLE).toEqual({ Ref: idempotencyId() });
+    for (const id of reviewWorkers()) {
+      expect((t.findResources('AWS::Lambda::Function')[id] as any).Properties.Environment.Variables.THREAD_RESOLVER_FUNCTION)
+        .toEqual({ Ref: resolverId });
+    }
+
+    const statements = statementsForRole(t, roleOfFunction(t, resolverId!));
+    const onTable = statements.filter((st) => JSON.stringify(st.Resource).includes(idempotencyId()));
+    expect(onTable).toEqual([{
+      Sid: 'ResolveGrants',
+      Effect: 'Allow',
+      Action: 'dynamodb:GetItem',
+      Resource: { 'Fn::GetAtt': [idempotencyId(), 'Arn'] },
+      Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['resolve#*'] } },
+    }]);
+    expect(statements.flatMap(actionsOf).filter((a) => /^dynamodb:(Put|Delete|Update|BatchWrite)/.test(a))).toEqual([]);
+
+    const permissions = Object.values(t.findResources('AWS::Lambda::Permission'))
+      .map((p: any) => p.Properties)
+      .filter((p) => JSON.stringify(p.FunctionName).includes(resolverId!));
+    expect(permissions).toHaveLength(s.stacks.reviewers.size);
+    for (const p of permissions) expect(p.Action).toEqual('lambda:InvokeFunction');
+    const principals = JSON.stringify(permissions.map((p) => p.Principal));
+    for (const reviewer of s.stacks.reviewers.values()) {
+      expect(principals).toContain(reviewer.stackName);
+    }
+    expect(principals).not.toContain('Curator');
   });
 
   test('review workers write only through UpdateItem in the heartbeat table, for the start record', () => {

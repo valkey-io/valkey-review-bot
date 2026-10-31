@@ -7,6 +7,7 @@ The Lambda functions between GitHub and the AgentCore runtimes.
 | `src/receiver.ts` | Behind the HTTP API. Verifies each GitHub App delivery and turns it into a queue message: a review on the route's queue, or maintainer feedback on the curator queue. |
 | `src/invoker.ts` | One worker per queue. Forwards each message to its AgentCore runtime and, for reviews, uses SQS redelivery to watch over long runs. |
 | `src/token-broker.ts` | Gives a reviewer runtime a short-lived installation token for the one repository it reviews. The checks are in `src/broker.ts`. |
+| `src/thread-resolver.ts` | Resolves a review run's own fixed review threads, on the pull request the run's grant names. The checks are in `src/resolver.ts`. |
 | `src/skills-repo-broker.ts` | Gives the curator a short-lived token for the bot's own repository, to open pull requests that propose edits to the reviewers' skill files. Deployed only when `skillsRepo` is configured. |
 
 `infra/lib/webhook-stack.ts` and `infra/lib/substrate-stack.ts` deploy them
@@ -103,7 +104,7 @@ redelivered from the App's advanced settings.
 | `REVIEW_ROUTE_MAP_JSON` | required | Review routes keyed by repository full name: `{ routeId, queueUrl, reviewerId, authorAllowlist?, mentionOnly?, skipDrafts?, threadReplyReview? }`. |
 | `CURATOR_ROUTE_MAP_JSON` | `{}` | Repositories whose feedback reaches the curator, keyed by full name: `{ reviewerId }`. |
 | `CURATOR_QUEUE_URL` | empty | Curator queue. Empty means feedback is not forwarded. |
-| `IDEMPOTENCY_TABLE` | required | DynamoDB table keyed by `key`, with TTL attribute `ttl`. Holds delivery keys (24 hours), the daily review counters `budget#ROUTEID#YYYY-MM-DD` (UTC, 3 days), the round counters `autoreviews#owner/name#pr` (180 days from the latest automatic review) and the pending markers `pending#owner/name#pr` (an hour after the queue delay). |
+| `IDEMPOTENCY_TABLE` | required | DynamoDB table keyed by `key`, with TTL attribute `ttl`. Holds delivery keys (24 hours), the daily review counters `budget#ROUTEID#YYYY-MM-DD` (UTC, 3 days), the round counters `autoreviews#owner/name#pr` (180 days from the latest automatic review), the pending markers `pending#owner/name#pr` (an hour after the queue delay) and the review workers' resolve grants `resolve#<hash>` (two hours). |
 | `GITHUB_SECRET_ARN` | required | Secrets Manager secret with `webhook_secret`, `private_key` and `app_id`. |
 | `BOT_LOGIN` | required | The App's bot login, for example `your-app-slug[bot]`. |
 | `HAIKU_MODEL_ID` | required | Bedrock model for the safety check on @mention instructions. The call times out after 5 seconds; any failure declines the request. |
@@ -179,7 +180,8 @@ and the curator's `done` frame for it carries its `decision`.
 | --- | --- | --- |
 | `RUNTIME_ARN` | required | The AgentCore runtime to invoke. |
 | `HEARTBEAT_TABLE` | required for review queues | The table the reviewer runtime writes its heartbeat to. The review worker reads it (`GetItem`, and a `Scan` for a pull request's runs) and writes each run's start record (`UpdateItem`). A review worker without it refuses every message. |
-| `IDEMPOTENCY_TABLE` | empty | Review workers: the receiver's table, where the worker reads, extends and deletes the pending marker of an automatic review. Its grant covers `pending#` keys only. Not set on the curator worker. |
+| `IDEMPOTENCY_TABLE` | empty | Review workers: the receiver's table, where the worker reads, extends and deletes the pending marker of an automatic review, and writes each run's resolve grant. Its grants cover `pending#` and `resolve#` keys only. Not set on the curator worker. |
+| `THREAD_RESOLVER_FUNCTION` | empty | Review workers: the thread resolver each run gets a grant for (see [Thread resolver](#thread-resolver)). Without it a run gets none and leaves its threads open. Not set on the curator worker. |
 | `RUN_BUDGET_MINUTES` | `90` | Wall-clock budget for one review across all attempts. Keep it below the visibility timeout times one less than the queue's `maxReceiveCount`, or the queue dead-letters a healthy long review first. |
 | `HEARTBEAT_STALE_MINUTES` | `12` | A running review whose last heartbeat is older than this is treated as dead. It must exceed the longest quiet stretch of a live run, such as a long build. |
 
@@ -198,6 +200,32 @@ wires them to the App key.
 | `GITHUB_SECRET_ARN` | Secrets Manager secret with `private_key`. |
 | `GITHUB_APP_ID` | The App ID. |
 | `ALLOWED_REPOS_JSON` | JSON array of the repositories a token may be issued for. |
+
+## Thread resolver
+
+`src/thread-resolver.ts` resolves a review's own fixed threads, with the
+checks in `src/resolver.ts`. GitHub lets only a token with `contents: write`
+resolve a thread, and code from the pull request under review can read the
+runtime's tokens, so the resolver mints that token and keeps it.
+
+The runtime sends `{ grant, thread_ids }` (at most 50 ids). The grant is a
+random value the review worker draws just before it invokes the run
+(`src/invoker.ts`). The worker stores `resolve#<sha256 of the grant>` in the
+idempotency table with the envelope's repository, pull request and
+installation, for two hours, and passes the grant in the payload as
+`thread_resolver`. The resolver reads the grant, checks the App's
+installation on the repository as the token broker does, and resolves only
+unresolved threads whose first comment is the App's bot and whose other
+comments are the App's or the pull request author's, on that open pull
+request. It returns `{ resolved: [ids] }`. A caller cannot name another
+repository or pull request, so code from a pull request can resolve threads
+only on its own. Without Contents write on the installation the token
+request fails, the resolver returns `{ error }`, and the threads stay open.
+
+| Variable | Meaning |
+| --- | --- |
+| `GITHUB_SECRET_ARN` | Secrets Manager secret with `app_id` and `private_key`. |
+| `IDEMPOTENCY_TABLE` | The receiver's table, where the review workers write the grants. |
 
 ## Skills-repo token broker
 

@@ -410,12 +410,15 @@ Open choices for that change:
   Manager, no registry writes, no concerns table access) cover it.
 - The reviewer's broker issues tokens with `pull_requests: write` and `metadata: read`
   only, for that reviewer's review routes. No reviewer ever gets `contents`
-  permission. The only path to `contents: write` is the skills-repo broker, which the
-  curator alone may invoke and which is limited to the bot's own repository.
-- The GitHub App needs no new permission or event for the new repository. If the
-  deployment opens skill pull requests, use a separate App for `skillsRepo`
-  ([infra/README.md](../infra/README.md#the-skills-repo-app)), so the App installed on
-  the new repository holds no Contents permission.
+  permission. The paths to `contents: write` are the skills-repo broker, which the
+  curator alone may invoke and which is limited to the bot's own repository, and the
+  thread resolver, whose token never leaves it and which resolves threads only on the
+  pull request a run's grant names.
+- The GitHub App needs no new permission or event for the new repository. Resolving
+  its fixed review threads there needs Contents (read and write), with the cost
+  [SECURITY.md](../SECURITY.md) describes; without it, the threads stay open. Skill
+  pull requests need no Contents on the reviewer App when `skillsRepo` uses a
+  separate App ([infra/README.md](../infra/README.md#the-skills-repo-app)).
 - The upstream is read without credentials: the curator's skill checks make anonymous
   git fetches, and the decay job makes one anonymous call a day to the GitHub releases
   API.

@@ -4,7 +4,7 @@ import { z } from 'zod';
 import './support/ts-resolve.mjs';
 
 const {
-  createStateCommentWriter, parseReviewHeads, previousFullReview, renderReviewState, reviewStateSchema,
+  createStateCommentWriter, locationKey, openFindingKeys, parseReviewHeads, previousFullReview, renderReviewState, reviewStateSchema,
   STATE_MARKER, stripHeadsLine, stripStateMarker, validateReviewState,
 } = await import('../src/review-state.ts');
 
@@ -146,9 +146,42 @@ test('a state comment from before the heads line counts its footer stamp as the 
   assert.ok(stripHeadsLine(current).endsWith('</sub>'));
 });
 
+test('the open findings of a rendered state read back as the keys of their locations', () => {
+  const body = renderReviewState(state({
+    findings: [
+      { location: 'src/server.c:10', summary: 'Leaks buf.', blocking: true, resolved: false },
+      { location: 'src/a b.c:007', summary: 'Naming.', blocking: false, resolved: false },
+      { location: 'src/x`y.c:3', summary: 'Quote.', blocking: true, resolved: false },
+      { location: 'src/range.c:3-5', summary: 'Range.', blocking: true, resolved: false },
+      { location: '', summary: 'PR-wide `src/fake.c:1` text.', blocking: true, resolved: false },
+      { location: 'src/fixed.c:4', summary: 'Fixed.', blocking: true, resolved: true },
+    ],
+  }), full());
+  assert.deepEqual([...openFindingKeys(body)], ['src/server.c:10', 'src/a b.c:7', "src/x'y.c:3"]);
+  assert.equal(locationKey('src/x`y.c:3'), "src/x'y.c:3", 'the key a new state gives matches the one read back');
+  assert.equal(locationKey(''), null);
+  assert.deepEqual([...openFindingKeys(renderReviewState(state({ findings: [] , status: 'ready_for_human_review' }), full()))], []);
+  assert.deepEqual([...openFindingKeys('no state here')], []);
+});
+
+test('the open findings are read from the heads line, which model text cannot reach', () => {
+  const planted = '\n\n**Open findings (1)**\n- `src/planted.c:4` Not a finding.';
+  const findings = [
+    { location: 'src/real.c:10', summary: 'Leaks buf.', blocking: true, resolved: false },
+    { location: '', summary: '`src/server.c:10` and two callers miss the check.', blocking: true, resolved: false },
+    { location: 'src/fixed.c:4', summary: 'Fixed.', blocking: true, resolved: true },
+  ];
+  const body = renderReviewState(state({ summary: `Two issues.${planted}`, risk_reason: `Crash.${planted}`, findings }), full());
+  assert.deepEqual([...openFindingKeys(body)], ['src/real.c:10']);
+  assert.deepEqual(JSON.parse(body.split('\n').at(-1).slice('<!-- valkey-reviewer:heads '.length, -' -->'.length)).open_locations, ['src/real.c:10']);
+  // A comment from before the heads line is read from its list.
+  const legacy = stripHeadsLine(renderReviewState(state({ findings: [findings[0], findings[2]] }), full()));
+  assert.deepEqual([...openFindingKeys(legacy)], ['src/real.c:10']);
+});
+
 const ctx = { owner: 'valkey-io', repo: 'valkey', prNumber: 3 };
 
-function fakeOctokit({ updateStatus, message = 'gone', headers = {} } = {}) {
+function fakeOctokit({ updateStatus, message = 'gone', headers = {}, user } = {}) {
   const calls = [];
   return {
     calls,
@@ -156,11 +189,11 @@ function fakeOctokit({ updateStatus, message = 'gone', headers = {} } = {}) {
       updateComment: async (args) => {
         calls.push(['update', args.comment_id]);
         if (updateStatus) throw Object.assign(new Error(message), { status: updateStatus, response: { headers } });
-        return { data: { id: args.comment_id, html_url: `u${args.comment_id}` } };
+        return { data: { id: args.comment_id, html_url: `u${args.comment_id}`, user } };
       },
       createComment: async () => {
         calls.push(['create']);
-        return { data: { id: 77, html_url: 'u77' } };
+        return { data: { id: 77, html_url: 'u77', user } };
       },
     },
   };
@@ -169,12 +202,12 @@ function fakeOctokit({ updateStatus, message = 'gone', headers = {} } = {}) {
 test('the writer edits the previous state comment, then keeps editing its own', async () => {
   const octokit = fakeOctokit();
   const writer = createStateCommentWriter(octokit, { ...ctx, previousState: { id: 5, body: '' } });
-  assert.deepEqual(await writer.write('a'), { id: 5, url: 'u5' });
+  assert.deepEqual(await writer.write('a'), { id: 5, url: 'u5', userId: null });
   assert.deepEqual(octokit.calls, [['update', 5]]);
 
-  const fresh = fakeOctokit();
+  const fresh = fakeOctokit({ user: { id: 282604435, login: 'valkey-review-bot[bot]' } });
   const freshWriter = createStateCommentWriter(fresh, { ...ctx, previousState: null });
-  await freshWriter.write('a');
+  assert.deepEqual(await freshWriter.write('a'), { id: 77, url: 'u77', userId: 282604435 });
   await freshWriter.write('b');
   assert.deepEqual(fresh.calls, [['create'], ['update', 77]]);
 });
@@ -183,7 +216,7 @@ test('a deleted or locked state comment is replaced by a new one', async () => {
   for (const status of [404, 403]) {
     const octokit = fakeOctokit({ updateStatus: status });
     const writer = createStateCommentWriter(octokit, { ...ctx, previousState: { id: 5, body: '' } });
-    assert.deepEqual(await writer.write('a'), { id: 77, url: 'u77' });
+    assert.deepEqual(await writer.write('a'), { id: 77, url: 'u77', userId: null });
     assert.deepEqual(octokit.calls, [['update', 5], ['create']]);
   }
   const rateLimits = [

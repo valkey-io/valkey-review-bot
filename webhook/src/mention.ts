@@ -327,7 +327,7 @@ async function startRun(
   // gets the App's original comment. In anyone else's thread the reply
   // is an ordinary summons. A failed fetch also falls back to an
   // ordinary summons.
-  let finding: { body: string; path?: string; line?: number } | undefined;
+  let finding: { body: string; path?: string; line?: number; originalLine?: number } | undefined;
   if (mention.kind === 'thread_reply' && mention.parentCommentId) {
     const parent = await fetchReviewComment(api, repo, mention.parentCommentId).catch(() => undefined);
     if (parent && isAppLogin(parent.author, deps.botLogin)) finding = parent;
@@ -372,8 +372,12 @@ async function startRun(
     // finding.path is a file name from the PR, so it is quoted as a JSON
     // string rather than set in backticks the name could close. It is
     // also bounded, so even with the longest reply the quote has room
-    // and the directive is never cut.
-    const loc = finding.path ? `${quotePath(finding.path)}${finding.line ? ` line ${finding.line}` : ''}` : 'the PR';
+    // and the directive is never cut. The line is the one the comment was
+    // posted on, as the review state records the finding, then the line
+    // it is on now when it moved.
+    const posted = finding.originalLine ?? finding.line;
+    const moved = finding.line !== undefined && finding.line !== posted ? ` (now line ${finding.line})` : '';
+    const loc = finding.path ? `${quotePath(finding.path)}${posted ? ` line ${posted}${moved}` : ''}` : 'the PR';
     const opening = `This is a reply to you in a review thread. You left this review comment on ${loc}:`;
     const reply = `@${mention.actor} replied: ${requestText || '(asked you to check the fix)'}`;
     // Six newlines join the seven lines below.

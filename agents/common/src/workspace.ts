@@ -433,6 +433,16 @@ function newest<T>(items: readonly T[]): readonly T[] {
   return items.slice(-OVERVIEW_LIST_LIMIT);
 }
 
+/**
+ * The line an inline comment was posted at, then its line at the head
+ * when that moved. A finding keeps the first as its location, and the
+ * runtime matches the comment's thread by either.
+ */
+function commentLine(c: { readonly line: number | null; readonly originalLine: number | null }): string {
+  if (c.originalLine === null) return String(c.line ?? '?');
+  return c.line !== null && c.line !== c.originalLine ? `${c.originalLine} (now line ${c.line})` : String(c.originalLine);
+}
+
 export function renderPrOverview(ctx: PrContext): string {
   const lines: string[] = [];
   lines.push(`# PR #${ctx.prNumber} in ${ctx.owner}/${ctx.repo}`);
@@ -470,7 +480,7 @@ export function renderPrOverview(ctx: PrContext): string {
   if (ctx.existingReviewComments.length > 0) {
     lines.push(`## Existing inline comments (${shownCount(ctx.existingReviewComments.length)})`);
     lines.push(...untrusted('inline review comments', newest(ctx.existingReviewComments).map((c) =>
-      `- ${c.user} on ${c.path}:${c.line ?? c.originalLine ?? '?'}: ${excerpt(c.body)}`)));
+      `- ${c.user} on ${c.path}:${commentLine(c)}: ${excerpt(c.body)}`)));
     lines.push('');
   }
   if (ctx.existingIssueComments.length > 0) {

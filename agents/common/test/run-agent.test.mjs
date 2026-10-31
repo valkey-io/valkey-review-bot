@@ -426,3 +426,40 @@ test('a review that ends its turn on the last allowed call was not stopped by th
   assert.doesNotMatch(stateBodies[0], /partial review/);
   assert.match(stateBodies[0].split('\n').at(-1), /"full_review":"/);
 });
+
+test('the worker\'s resolve grant reaches the tools as a thread resolver, and a run without one gets none', async (t) => {
+  recordHeartbeats(t);
+  const created = [];
+  const seen = [];
+  const handlerFor = () => createReviewHandler({
+    env,
+    systemPrompt: 'You review pull requests.',
+    assembleTools: async ({ ctx: prCtx, octokit, tokens, onTerminal, threadResolver }) => {
+      seen.push(threadResolver);
+      const deps = {
+        ctx: prCtx, octokit, tokens,
+        stateWriter: { write: async () => ({ id: 1, url: 'https://github.com/state' }) },
+        terminalGate: createTerminalGate(onTerminal),
+      };
+      return [noop, buildPostReviewTool(deps), buildSkipTool(deps)];
+    },
+    deps: {
+      createModel: () => new ScriptedModel([skipTurn, textTurn('Done.')]),
+      createTokenSource: () => ({ get: async () => 'token' }),
+      createThreadResolver: (opts) => { created.push(opts); return { resolve: async (ids) => ids }; },
+      createOctokit: () => ({}),
+      prepareWorkspace: async () => ({ ...ctx, trigger: 'push' }),
+      loadGraduatedSkills: async () => [],
+      createStatusComment: () => { throw new Error('only mention runs have a status comment'); },
+    },
+  });
+  const grant = 'g'.repeat(43);
+  await consume(handlerFor()(requestSchema.parse({ ...payload, thread_resolver: { function_name: 'thread-resolver', grant } })));
+  assert.deepEqual(created, [{ functionName: 'thread-resolver', grant, region: env.region }]);
+  assert.equal(typeof seen[0]?.resolve, 'function');
+
+  await consume(handlerFor()(requestSchema.parse(payload)));
+  assert.equal(created.length, 1);
+  assert.equal(seen[1], undefined);
+  assert.throws(() => requestSchema.parse({ ...payload, thread_resolver: { function_name: 'thread-resolver', grant: 'short' } }));
+});

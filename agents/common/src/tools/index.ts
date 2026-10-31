@@ -2,6 +2,7 @@ import type { Octokit } from '@octokit/rest';
 import type { PrContext } from '../workspace.js';
 import type { StatusComment } from '../status-comment.js';
 import type { TokenSource } from '../github-auth.js';
+import type { ThreadResolver } from '../thread-resolver.js';
 import { createStateCommentWriter } from '../review-state.js';
 import { buildHarnessTools } from './harness.js';
 import { buildGitTool } from './git.js';
@@ -21,6 +22,8 @@ export interface CommonToolsOpts {
   readonly onTerminal?: (tool: TerminalToolName, result: string) => void;
   /** True once the model call limit stopped the review; pass through from AssembleBaseOpts. */
   readonly callLimitReached?: () => boolean;
+  /** Resolves the run's own fixed threads; pass through from AssembleBaseOpts. */
+  readonly threadResolver?: ThreadResolver;
 }
 
 /**
@@ -45,6 +48,7 @@ export async function assembleCommonTools(opts: CommonToolsOpts): Promise<readon
     stateWriter: createStateCommentWriter(opts.octokit, opts.ctx),
     terminalGate: createTerminalGate(opts.onTerminal),
     callLimitReached: opts.callLimitReached,
+    threadResolver: opts.threadResolver,
   };
 
   return [
