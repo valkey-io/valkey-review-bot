@@ -346,10 +346,34 @@ describe('skills repository', () => {
     expect(ids).toHaveLength(1);
     const fn = (t.findResources('AWS::Lambda::Function')[ids[0]!] as any).Properties;
     expect(fn).toMatchObject({ Runtime: 'nodejs24.x', Architectures: ['arm64'], Timeout: 15, MemorySize: 256 });
-    expect(fn.Environment.Variables).toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/github-app' });
+    expect(fn.Environment.Variables).toEqual({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_APP_SECRET_NAME: 'example/github-app',
+      MAIN_APP_ID: '123456',
+      SKILLS_REPO_BOT_REVIEWED: 'false',
+    });
     expect(t.toJSON().Outputs.SkillsRepoTokenBrokerFunctionName.Value).toEqual({ Ref: ids[0] });
     expect(functionEnv(custom.template(custom.stacks.substrate), 'SkillsRepoTokenBrokerFn'))
-      .toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app' });
+      .toEqual({
+        SKILLS_REPO: 'example-org/valkey-review-bot',
+        SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app',
+        MAIN_APP_ID: '123456',
+        SKILLS_REPO_BOT_REVIEWED: 'false',
+      });
+    const reviewed = synth({
+      ...fixture(),
+      skillsRepo: { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' },
+      routes: [...fixture().routes, {
+        id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot',
+        mentionOnly: true,
+      }],
+    });
+    expect(functionEnv(reviewed.template(reviewed.stacks.substrate), 'SkillsRepoTokenBrokerFn')).toEqual({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app',
+      MAIN_APP_ID: '123456',
+      SKILLS_REPO_BOT_REVIEWED: 'true',
+    });
   });
 
   test('the broker may read its App secret and nothing else', () => {

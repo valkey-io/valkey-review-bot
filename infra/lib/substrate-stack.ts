@@ -108,6 +108,11 @@ export class SubstrateStack extends cdk.Stack {
     // runtime or reviewer broker can reach it.
     if (props.skillsRepo) {
       const secretName = props.skillsRepo.appSecretName;
+      // Synthesis compares secret names, so two secrets holding the same
+      // App would pass. The broker compares the app_id values at runtime
+      // when the bot repository is reviewed (see skills-repo-broker.ts).
+      const botRepoReviewed = Object.values(props.allowedRepos).flat()
+        .some((repo) => repo.toLowerCase() === props.skillsRepo!.repo.toLowerCase());
       const broker = new nodelambda.NodejsFunction(this, 'SkillsRepoTokenBrokerFn', {
         entry: path.join(webhookRoot, 'src', 'skills-repo-broker.ts'),
         depsLockFilePath: path.join(webhookRoot, 'package-lock.json'),
@@ -120,6 +125,8 @@ export class SubstrateStack extends cdk.Stack {
           SKILLS_REPO: props.skillsRepo.repo,
           // Passed as the SecretId.
           SKILLS_REPO_APP_SECRET_NAME: secretName,
+          MAIN_APP_ID: props.github.appId,
+          SKILLS_REPO_BOT_REVIEWED: botRepoReviewed ? 'true' : 'false',
         },
         logGroup: new logs.LogGroup(this, 'SkillsRepoTokenBrokerLogs', { retention: logs.RetentionDays.ONE_MONTH }),
         bundling: { externalModules: ['@aws-sdk/*'], target: 'node24', minify: false, sourceMap: true },

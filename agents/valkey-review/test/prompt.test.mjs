@@ -100,4 +100,17 @@ test('the reviewer prompts share the mention and suppressed-skill text', () => {
   const para = (prompt) => prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.equal(para(valkey), para(glide));
   assert.equal(para(valkey), para(bot));
+  // The Findings and Status lines stay in sync too, so a change to the
+  // valkey or GLIDE prompt (for example #72 or #73) fails here unless the
+  // bot prompt is updated as well.
+  const line = (prompt, prefix) => prompt.split('\n').find((l) => l.startsWith(prefix));
+  assert.equal(line(glide, '- **Findings.**'), line(valkey, '- **Findings.**'));
+  assert.equal(
+    line(bot, '- **Findings.**'),
+    line(valkey, '- **Findings.**').replace('bugs, broken', 'bugs, security regressions, broken'),
+  );
+  assert.equal(line(glide, '- **Status.**'), line(valkey, '- **Status.**'));
+  assert.equal(line(bot, '- **Status.**') + ' A needed backport does not block.', line(valkey, '- **Status.**'));
+  assert.equal(line(glide, '- **Coverage.**'), line(valkey, '- **Coverage.**'));
+  assert.equal(line(bot, '- **Coverage.**'), line(valkey, '- **Coverage.**'));
 });

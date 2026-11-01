@@ -446,6 +446,18 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
     && routes.some((route) => route.repo.toLowerCase() === skillsRepo.repo.toLowerCase())) {
     r.fail('skillsRepo.appSecretName', `is the main App's secret, but routes review ${skillsRepo.repo}. Give skillsRepo an App of its own (infra/README.md, "The skills-repo App")`);
   }
+  // Even with a separate skills App, an automatic review still runs pull
+  // request code with reviewer tokens for the bot repository. Those tokens
+  // can post reviews and close the curator's skill pull requests. Require
+  // an explicit trigger there: a mention or an author allowlist.
+  if (skillsRepo) {
+    routes.forEach((route, i) => {
+      if (route.repo.toLowerCase() === skillsRepo.repo.toLowerCase()
+        && !route.mentionOnly && route.authorAllowlist.length === 0) {
+        r.fail(`routes[${i}].mentionOnly`, `reviews ${skillsRepo.repo} automatically, so pull request code there runs with reviewer tokens. Set mentionOnly or authorAllowlist for this route (infra/README.md, "The skills-repo App")`);
+      }
+    });
+  }
 
   const dailyReviewBudget = r.number(top.dailyReviewBudget, 'dailyReviewBudget', { fallback: 40, min: 0, max: 10_000, integer: true });
   // The receiver enforces the same ranges (webhook/src/config.ts); SQS

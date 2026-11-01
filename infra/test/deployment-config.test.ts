@@ -510,7 +510,7 @@ describe('skillsRepo', () => {
   test('a review route on the bot repository needs a skills App of its own', () => {
     const routeTo = (repo: string, appSecretName?: string) => withChange((raw) => {
       raw.skillsRepo = { repo: 'example-org/valkey-review-bot', ...(appSecretName ? { appSecretName } : {}) };
-      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo }];
+      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo, mentionOnly: true }];
     });
     const message = "skillsRepo.appSecretName is the main App's secret, but routes review example-org/valkey-review-bot. Give skillsRepo an App of its own (infra/README.md, \"The skills-repo App\")";
     expect(problems(routeTo('example-org/valkey-review-bot'))).toContain(message);
@@ -518,6 +518,23 @@ describe('skillsRepo', () => {
     expect(problems(routeTo('example-org/valkey-review-bot', 'example/github-app'))).toContain(message);
     expect(parseDeploymentConfig(routeTo('example-org/valkey-review-bot', 'example/skills-app')).skillsRepo?.appSecretName).toBe('example/skills-app');
     expect(parseDeploymentConfig(routeTo('example-org/other')).skillsRepo?.appSecretName).toBe('example/github-app');
+  });
+
+  test('a route on the bot repository needs an explicit trigger', () => {
+    const routeTo = (extra: object) => withChange((raw) => {
+      raw.skillsRepo = { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' };
+      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot', ...extra }];
+    });
+    const message = 'reviews example-org/valkey-review-bot automatically, so pull request code there runs with reviewer tokens. Set mentionOnly or authorAllowlist for this route';
+    expect(problems(routeTo({}))).toContain(message);
+    expect(problems(routeTo({ mentionOnly: false, authorAllowlist: [] }))).toContain(message);
+    expect(parseDeploymentConfig(routeTo({ mentionOnly: true })).routes.at(-1)?.mentionOnly).toBe(true);
+    expect(parseDeploymentConfig(routeTo({ authorAllowlist: ['some-maintainer'] })).routes.at(-1)?.authorAllowlist).toEqual(['some-maintainer']);
+    // Other repositories keep automatic reviews.
+    expect(parseDeploymentConfig(withChange((raw) => {
+      raw.skillsRepo = { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' };
+      raw.routes = [...raw.routes, { id: 'other-review', reviewer: 'valkey-review', repo: 'example-org/other' }];
+    })).routes.at(-1)?.mentionOnly).toBe(false);
   });
 
   test.each(['just-a-name', 'example-org/..', 'example-org/.', 'example-org/a b'])('repo %j is rejected', (repo) => {

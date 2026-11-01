@@ -42,9 +42,16 @@ away from it:
   for the bot repository, like code in pull requests to any routed
   repository. With them it can post reviews and comments as the bot, and
   edit or close pull requests there, the curator's skill pull requests
-  included. The configuration refuses such a route unless `skillsRepo` has an
-  App of its own, so the App the reviewers use never holds Contents on that
-  repository. Keep required reviews from maintainers on its base branch.
+  included. Closing a skill-check pull request without merging counts as
+  declining it: `closedUnmerged()` in `agents/curator/src/repo-skill-pr.ts`
+  treats it as rejected, and the curator proposes nothing more for that
+  release. So pull request code can quietly suppress a release's skill
+  corrections, not just tidy up pull requests. The configuration refuses
+  such a route unless `skillsRepo` has an App of its own, so the App the
+  reviewers use never holds Contents on that repository. It also refuses an
+  automatic review there: the route needs `mentionOnly` or an
+  `authorAllowlist`. Keep required reviews from maintainers on its base
+  branch.
   The receiver and the reviewer brokers ask for explicit permissions without
   `contents`, so with the reviewer App here none of their tokens carries it.
   But every account the reviewer App is installed on would have to grant it

@@ -663,7 +663,13 @@ write), and each account it is installed on, such as `valkey-io` for
 which the receiver and the reviewer brokers can read, could then mint
 `contents: write` tokens for every repository the App is installed on.
 A deployment with a route that reviews the bot repository must use an App
-of its own here: the configuration refuses the main App's secret then.
+of its own here: the configuration refuses the main App's secret then, and
+refuses an automatic review there (the route needs `mentionOnly` or an
+`authorAllowlist`). The name check compares secret names only, so two
+secrets holding the same App's credentials would pass it. The skills-repo
+broker therefore compares the secrets' `app_id` values at runtime when the
+bot repository is reviewed, and refuses to issue a token when they match.
+Keep the two secrets on different Apps.
 
 The receiver and the reviewer brokers ask for explicit permissions without
 Contents either way: the receiver for `pull_requests: write`,
