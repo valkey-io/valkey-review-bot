@@ -1,6 +1,6 @@
 ---
 name: writing-reviewer-skills
-description: Writes, restructures and checks the knowledge the review agents load. That covers built-in skills in agents/<id>/config/skill.md, the curator's skill reference and skill-related rules in reviewer prompts. Use when creating or editing any config/skill.md, landing a new reviewer, or reviewing a pull request that changes reviewer knowledge, even if the request only says "update the reviewer" or "add what maintainers keep asking for".
+description: Writes, restructures and checks the knowledge the review agents load. That covers each reviewer's built-in config/skill.md, the curator's skill reference and skill-related rules in reviewer prompts. Use when creating or editing any config/skill.md, landing a new reviewer, or reviewing a pull request that changes reviewer knowledge, even if the request only says "update the reviewer" or "add what maintainers keep asking for".
 ---
 
 # Writing reviewer skills
@@ -40,7 +40,11 @@ Follow the layout `agents/valkey-review/config/skill.md` uses, in this order. Om
 
 - **Exact names in backticks.** Every file path, function, type, constant, config key and command, spelled as in the code. `scripts/skill-facts.mjs` looks up every backticked name upstream; a misspelled, paraphrased or invented name reads as stale.
 - **Placeholders only in fenced blocks.** An angle-bracket placeholder or an invented example name in backticks in prose would be looked up and reported absent.
-- **Defaults in one sentence with their name:** "`<name>` defaults to <value>."
+- **Defaults in one sentence with their name**, so the value stays tied to it:
+
+  ```
+  `<name>` defaults to <value>.
+  ```
 - **No pull request numbers, issue numbers, maintainer names or logins.** The pattern is the signal; identities and numbers rot.
 - **No time-sensitive wording** ("now", "recently", "as of", "no longer", "since the rewrite"). State the current invariant. History that still matters for older release lines goes in the reviewer memory as a fact about those lines.
 - **Reasons over capitals.** Say why a rule exists instead of writing ALWAYS or NEVER.
@@ -64,7 +68,7 @@ Run all of these and name the upstream ref you checked in the pull request.
    It exits 0 when clean and 2 when names are absent.
 2. Claims match the code. Have a reviewer with no prior context check each factual claim against the upstream default branch, citing `file:line` for each one it confirms, and fix or remove the rest. `skill-facts` only proves the names exist, not that the sentences about them are true.
 3. Structure. Each pattern has its three lines, the confidence ladder is near the top, and the forbidden wording above is absent.
-4. Tests of the reviewer package pass (`npm test` in `agents/<id>`), and `agnix .` passes for this repository's agent files, including this skill.
+4. Tests of the reviewer package pass (`npm test` in the reviewer's package under `agents/`), and `agnix .` passes for this repository's agent files, including this skill.
 5. Ask a maintainer of the reviewed project to read the patterns as claims the reviewer will make, and to say where one is wrong or needs a carve-out.
 
 ## After it ships
