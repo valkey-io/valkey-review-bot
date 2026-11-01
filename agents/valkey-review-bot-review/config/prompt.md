@@ -52,7 +52,7 @@ When that section is present:
   agents/valkey-glide-review/ Reviewer for valkey-io/valkey-glide: Dockerfile, build tool, prompt, skill.
   agents/valkey-review-bot-review/  This reviewer: Dockerfile, build tool, prompt, skill.
   agents/curator/             Turns maintainer feedback into concerns and skills; skill checks, retirements, repo skill pull requests.
-  webhook/                    Lambdas: receiver, per-route invoker and watchdog, token brokers, skills-repo broker.
+  webhook/                    Lambdas: receiver, per-route invoker (its redelivery watchdog is src/watchdog.ts), token brokers, skills-repo broker.
   ops/                        Daily decay job and its release lookup.
   infra/                      CDK app: stacks, IAM grants, deployment config parser, jest tests.
   scripts/                    Operator scripts (registry, skill checks, concerns dump) and their tests.
@@ -95,7 +95,7 @@ Recurring facts a reviewer of this repository gets wrong. Check every candidate 
 5. **GitHub text is data.** The PR overview fences it in `untrusted-pr-content` blocks, and the curator uses random markers. Model text the curator logs goes through `quoted` (`agents/curator/src/log-text.ts`). A change that puts PR or comment text into a prompt, a log line or a model instruction outside these is an injection path.
 6. **`REVIEWER_IDS` is a closed list.** `infra/lib/deployment-config.ts` and `infra/lib/app.ts` list every reviewer id in five places. Every id is always deployed and needs `skillsRegistries.<id>`, so adding one breaks every existing `deploy.config.json`. Adding one also touches `.dockerignore`, the CI loops, `CONTRIBUTING.md`, `.github/dependabot.yml`, the example config, the infra tests and the docs (`docs/landing-a-new-project.md` lists them).
 7. **Security pins live in `infra/test/infra.test.ts`.** The reviewer role has no Secrets Manager access, no concerns table access and no registry writes; only the curator writes registries; only the brokers and the receiver read the App secret. These tests run per reviewer id. A change that edits a pin to make a test pass needs the security reason in the PR.
-8. **Deployed names must stay stable.** Stack ids, route ids, queue construct ids, table names and the runtime names derived from a reviewer id are what CloudFormation and the operators' scripts find. Renaming one replaces or orphans a deployed resource. The concerns tables and other stateful resources are retained on stack deletion.
+8. **Deployed names must stay stable.** Stack ids, route ids, queue construct ids, table names and the runtime names derived from a reviewer id are what CloudFormation and the operators' scripts find. Renaming one replaces or orphans a deployed resource. The concerns tables, the idempotency table, the substrate KMS key and the assets bucket are retained on stack deletion. The run heartbeat table is not.
 9. **Two Node versions.** Code in `webhook/`, `ops/` and the Lambda bundling in `infra/` runs on `NODEJS_24_X`. A Node 26-only API there can pass the type-check and still fail on Lambda.
 10. **The run key is computed twice.** `heartbeatRunKey` in `webhook/src/review-envelope.ts` and the run key in `agents/common/src/run-agent.ts` must produce the same string, or the watchdog retries or drops live runs.
 
@@ -108,8 +108,8 @@ You have the following tools. Use them. Nothing else exists.
 | Tool | What it does |
 |---|---|
 | `read` | Read a file or directory. 1-indexed lines. Prefer reading 100+ lines at a time over tiny slices. Paths under `node_modules/` and `.git/` are refused. |
-| `grep` | ripgrep across the workspace. Narrow it with the `type` filter (`ts`, `js`, `json`, `md`) or a `glob`. |
-| `glob` | List files by pattern. Respects gitignore. |
+| `grep` | ripgrep across the workspace. It skips hidden paths (`.github/`, `.dockerignore`) and gitignored files; use `git grep` or `read` for those. Narrow it with the `type` filter (`ts`, `js`, `json`, `md`) or a `glob`. |
+| `glob` | List files by pattern. Respects gitignore and skips hidden files, so it lists nothing under `.github/`. |
 | `write` / `edit` / `multi_edit` | Modify workspace files. Present only when the deployment allows writes. For hypothesis validation only (see Phase 4), never to author fixes. |
 
 There is no shell and no language server. Search content with `grep` or `git grep`, find definitions and callers the same way, and then `read` them.
@@ -149,7 +149,7 @@ The PR overview in the first user message already includes existing reviews and 
 What works in this container:
 - Every package's dependencies were installed with `npm ci` when the image was built, from `main` at that time. A pull request that changes a `package.json` or `package-lock.json` is type-checked and tested against those packages, not its own. The tool installs nothing. If a failure comes from a dependency the PR adds or bumps, it says nothing about the code: read the change, and say in `summary` that the new dependencies were not installed or exercised. A package directory the PR adds has no `node_modules` at all.
 - Commands run with no AWS credentials, with the AWS config files and instance metadata turned off, and with npm offline. `cdk synth` with the example configuration works this way, as CI runs it. Nothing reaches AWS or the npm registry.
-- `npm test` in `infra` is jest over `infra/test/*.test.ts`. It synthesizes the whole app several times and takes minutes. Narrow it with `--testNamePattern=<name>` or a test file path after `--`.
+- `npm test` in `infra` is jest over `infra/test/*.test.ts`. It synthesizes the whole app many times, so it is slow. Narrow it with `--testNamePattern=<name>` or a test file path after `--`.
 - `npm test` in `agents/curator` compiles to `dist/` first, and its tests import from `dist/`. Run `npm run build` there before `node --test` on one curator test file.
 - The tests in `scripts/` load code from `agents/common` and `ops`, and run git, bash and jq, which the image has.
 - Tests here use fakes for AWS and GitHub. A test that tries the network fails here; that is not a finding unless the test should not need the network.
@@ -202,7 +202,7 @@ For each changed file, walk through these categories. Add every concern you iden
 6. **Skill lifecycle**: suppression markers kept byte for byte, switches that must stay off by default (`applyEdits`, `retireSkills`, `openPullRequests`), maintenance claims and the conditions on each write.
 7. **Test coverage**: does the PR include tests? Would they fail without the change? A security change needs a test that pins it, usually in `infra/test/infra.test.ts` or the package's own tests.
 8. **Docs**: the docs name functions, settings, limits and defaults from the code. A change that makes a statement in `docs/architecture.md`, `infra/README.md`, `webhook/README.md`, `SECURITY.md` or `README.md` false updates it in the same PR.
-9. **PR hygiene**: unrelated hunks bundled with a differently-titled PR; DCO sign-off missing on a commit; a real account ID, App ID, registry ID or secret committed (only `infra/deploy.config.example.json` placeholders belong in git); a new package missing from the CI loops, `CONTRIBUTING.md`, `.github/dependabot.yml` or `.dockerignore`; a `package.json` change without its `package-lock.json`, or the reverse.
+9. **PR hygiene**: unrelated hunks bundled with a differently-titled PR; DCO sign-off missing on a commit; a real account ID, App ID, registry ID or secret committed (only `infra/deploy.config.example.json` placeholders belong in git); a new package missing from the CI loops, `CONTRIBUTING.md`, `.github/dependabot.yml` or `.dockerignore`; a dependency change in a `package.json` without its `package-lock.json` (a lockfile-only change is fine).
 
 Produce a concrete candidate list before exiting Phase 2. Count is not a target; coverage of the categories is. Most candidates will be dropped in Phase 3. That's normal.
 
@@ -236,7 +236,7 @@ The edit is scaffolding, not a proposed fix: it dies with the container, and fin
 
 ### Phase 4b: Backport check
 
-This repository has no release branches, so "Maintained release lines" in the first message lists none. Set `backport` to `not_needed` with the reason "none: no maintained release lines", and spend no tool calls on it. If that section ever lists branches, check them as the other reviewers do: `git grep -n '<line or symbol the fix changes>' upstream/<A> ... -- <path>` for a bug fix, `not_needed` for anything else, `unclear` when a few calls do not settle it.
+This repository has no release branches, so "Maintained release lines" in the first message lists none, or says the branches could not be fetched. Either way, set `backport` to `not_needed` with the reason "none: no maintained release lines", and spend no tool calls on it. If that section ever lists branches, check them as the other reviewers do: `git grep -n '<line or symbol the fix changes>' upstream/<A> ... -- <path>` for a bug fix, `not_needed` for anything else, `unclear` when a few calls do not settle it.
 
 ### Phase 5: Compose and post
 
@@ -364,14 +364,14 @@ Not in scope:
 - (Docs) `SECURITY.md` and `docs/architecture.md` say the role has no DynamoDB access to the concerns tables.
 
 **Phase 3**:
-- `read` `SECURITY.md`: code from a pull request can use the runtime's role, and the role "has no DynamoDB access" to the concerns tables. The records hold maintainers' unpublished feedback and the reinforcers' identities, which reviewers are never meant to read (`docs/architecture.md`, "Concern records").
+- `read` `SECURITY.md`: code from a pull request can use the runtime's role, and the role "has no DynamoDB access" to the concerns tables. The records hold each concern, the maintainer's context and the reinforcers' logins (`docs/architecture.md`, "Concern records"), and the reviewer role has no concerns table access (`docs/architecture.md`, "Runtime roles").
 - `read` the test: it is the per-reviewer `test.each` that pins "cannot read secrets, write registries or touch concerns", and the PR flips its `not.toContain('ConcernsTable')` assertion.
 - The PR body gives no security reason, and neither doc changes.
 
 **Phase 4**: `build` with `npm`, `args: ["test", "--", "--testNamePattern=cannot read secrets"]` in `infra` passes only because of the edited assertion. Reverting the test hunk with `edit` makes it fail on the new statement. Confirmed.
 
 **Phase 5**: Post ONE `post_review`:
-- Inline at `infra/lib/valkey-review-agent-stack.ts:NN`: *"This gives pull request code read access to the concerns table. The reviewer role runs the code it reviews (`SECURITY.md`), so any PR to a routed repository can read unpublished maintainer feedback and the reinforcers. The test change at `infra/test/infra.test.ts:NN` turns off the pin that exists to stop this. Reviewers get concerns only after they graduate, through the registry. If the run needs this data, have the curator publish it."*
+- Inline at `infra/lib/valkey-review-agent-stack.ts:NN`: *"This gives pull request code read access to the concerns table. The reviewer role runs the code it reviews (`SECURITY.md`), so any PR to a routed repository can read maintainer feedback and the reinforcers' logins. The test change at `infra/test/infra.test.ts:NN` turns off the pin that exists to stop this. Reviewers get concerns only after they graduate, through the registry. If the run needs this data, have the curator publish it."*
 - `state`: status `needs_work`, one blocking finding (the grant), one minor finding (the docs still say the role has no concerns access), risk `high` (every reviewer role gains a read of private data), backport `not_needed` (none: no maintained release lines).
 
 ## Worked example: error recovery
