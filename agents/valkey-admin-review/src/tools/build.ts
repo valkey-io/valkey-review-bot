@@ -70,12 +70,12 @@ function format(r: BoundedResult): string {
 /**
  * The build tool. Each tool's script runs under this process's node, from
  * the installed node_modules: never npm, npx or a package script, so no
- * lifecycle script runs. Calls run one at a time, so the build of
- * `common/dist` that the first command needing it triggers
- * (`needsCommonBuild`) never overlaps a command that reads it.
+ * lifecycle script runs. Calls run one at a time. Every command that
+ * reads `common/dist` (`needsCommonBuild`) rebuilds it from the checkout
+ * first, so an edit to `common/src` between calls is never tested against
+ * a stale build, and the build never overlaps a command that reads it.
  */
 export function buildValkeyAdminBuildTool(opts: { workspaceRoot: string }) {
-  let commonBuilt = false;
   let queue: Promise<unknown> = Promise.resolve();
 
   const run = async (subcommand: Subcommand, args: readonly string[], dir: string): Promise<{ text: string; code: number }> => {
@@ -95,17 +95,14 @@ export function buildValkeyAdminBuildTool(opts: { workspaceRoot: string }) {
 
   const call = async (subcommand: Subcommand, args: readonly string[], dir: string): Promise<string> => {
     let prefix = '';
-    if (needsCommonBuild(subcommand, dir) && !commonBuilt) {
+    if (needsCommonBuild(subcommand, dir)) {
       const built = await run('tsup', COMMON_BUILD_ARGS, 'common');
       if (built.code !== 0) {
         return `common/dist could not be built from the checkout, so ${subcommand} in ${dir} did not run. tsup ${COMMON_BUILD_ARGS.join(' ')} in common:\n${built.text}`;
       }
-      commonBuilt = true;
       prefix = `[built common/dist from the checkout first: tsup ${COMMON_BUILD_ARGS.join(' ')}]\n\n`;
     }
     const result = await run(subcommand, args, dir);
-    // A failed tsup may have cleaned dist/ already.
-    if (subcommand === 'tsup') commonBuilt = result.code === 0;
     return prefix + result.text;
   };
 

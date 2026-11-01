@@ -185,20 +185,21 @@ test('with no installed copy of a tool, the tool says so and runs nothing', asyn
     /^ERROR: tsx is not installed in node_modules/);
 });
 
-test('common/dist is built once per review, before the first command that imports it', async () => {
+test('every command that imports common/dist rebuilds it from the checkout first', async () => {
   const root = workspace();
   const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
   const first = await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' });
   assert.match(first, /^\[built common\/dist from the checkout first: tsup /);
-  await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' });
+  // An edit to common/src between calls is picked up: the second reader
+  // builds again instead of reading the first build.
+  const second = await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' });
+  assert.match(second, /^\[built common\/dist from the checkout first: tsup /);
   await tool.invoke({ subcommand: 'vite', args: ['build'], dir: 'apps/server' });
+  // A command that does not import common/dist builds nothing.
   await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/frontend' });
   assert.deepEqual(calls(root).map((c) => `${c.bin} ${path.relative(root, c.cwd)}`), [
-    'tsup common', 'vitest apps/metrics', 'vitest apps/metrics', 'vite apps/server', 'vitest apps/frontend',
+    'tsup common', 'vitest apps/metrics', 'tsup common', 'vitest apps/metrics', 'tsup common', 'vite apps/server', 'vitest apps/frontend',
   ]);
-  // A new review (a new tool) builds again.
-  await buildValkeyAdminBuildTool({ workspaceRoot: root }).invoke({ subcommand: 'vite', args: ['build'], dir: 'apps/metrics' });
-  assert.deepEqual(calls(root).slice(-2).map((c) => c.bin), ['tsup', 'vite']);
 });
 
 test('when common does not build, the command that needs it does not run', async () => {
@@ -211,7 +212,7 @@ test('when common does not build, the command that needs it does not run', async
   assert.deepEqual(calls(root).map((c) => c.bin), ['tsup']);
 });
 
-test('parallel calls run one at a time, so common/dist is built once and before its readers', async () => {
+test('parallel calls run one at a time, so each build of common/dist comes right before its reader', async () => {
   const root = workspace();
   const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
   const outs = await Promise.all([
@@ -220,17 +221,19 @@ test('parallel calls run one at a time, so common/dist is built once and before 
     tool.invoke({ subcommand: 'tsc', args: ['--noEmit', '-p', 'tsconfig.json'], dir: 'apps/server' }),
   ]);
   for (const out of outs) assert.match(out, /\[exit 0\]$/);
-  assert.deepEqual(calls(root).map((c) => `${c.bin} ${path.relative(root, c.cwd)}`), ['tsup common', 'vitest apps/metrics', 'vite apps/server', 'tsc apps/server']);
+  assert.deepEqual(calls(root).map((c) => `${c.bin} ${path.relative(root, c.cwd)}`), [
+    'tsup common', 'vitest apps/metrics', 'tsup common', 'vite apps/server', 'tsup common', 'tsc apps/server',
+  ]);
 });
 
-test('a failed explicit tsup makes the next reader build common/dist again', async () => {
+test('a reader rebuilds common/dist even after an explicit tsup, and stops when it fails', async () => {
   const root = workspace();
   const tool = buildValkeyAdminBuildTool({ workspaceRoot: root });
+  assert.match(await tool.invoke({ subcommand: 'tsup', args: [...COMMON_BUILD_ARGS], dir: 'common' }), /\[exit 0\]$/);
   await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' });
   writeFileSync(path.join(root, 'fail-tsup'), '');
-  assert.match(await tool.invoke({ subcommand: 'tsup', args: [...COMMON_BUILD_ARGS], dir: 'common' }), /\[exit 1\]$/);
   assert.match(await tool.invoke({ subcommand: 'vitest', args: ['run'], dir: 'apps/metrics' }), /^common\/dist could not be built/);
-  assert.deepEqual(calls(root).map((c) => c.bin), ['tsup', 'vitest', 'tsup', 'tsup']);
+  assert.deepEqual(calls(root).map((c) => c.bin), ['tsup', 'tsup', 'vitest', 'tsup']);
 });
 
 // Code from the pull request runs here. It sees no credential, and the

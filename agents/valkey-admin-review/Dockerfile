@@ -100,8 +100,10 @@ RUN git clone --filter=blob:limit=1m https://github.com/valkey-io/valkey-admin.g
 # type-checked and tested against main's dependencies as of this build,
 # not against its own package-lock.json. node_modules belongs to the agent
 # user, so code under test can change it. That would carry over only into
-# a later review in the same container, and the invoker starts a new
-# session, so a new container, for every run (docs/architecture.md).
+# a later review in the same container, and every run gets a new session,
+# so a new container: InvokeAgentRuntimeCommand in webhook/src/invoker.ts
+# passes no runtimeSessionId. A change there that reuses sessions must
+# reset node_modules first.
 RUN cd /workspace/valkey-admin \
  && ELECTRON_SKIP_BINARY_DOWNLOAD=1 npm ci --ignore-scripts --no-audit --no-fund \
  && npm cache clean --force

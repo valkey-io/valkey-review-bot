@@ -75,7 +75,9 @@ export const OFFLINE_ENV: Readonly<Record<string, string>> = {
 };
 
 /** The tsc options allowed besides --noEmit and -p / --project. */
-export const TSC_OPTIONS: readonly string[] = ['--noEmit', '-p', '--project', '--pretty', '--listFiles', '--extendedDiagnostics'];
+// `--listFiles` is left out: on apps/frontend one call prints thousands of
+// paths and fills much of the 1 MB output cap.
+export const TSC_OPTIONS: readonly string[] = ['--noEmit', '-p', '--project', '--pretty', '--extendedDiagnostics'];
 
 /** The eslint options allowed besides paths. No --fix, no config, plugin, cache or output file. */
 export const ESLINT_OPTIONS: readonly string[] = ['--quiet', '--max-warnings', '--no-warn-ignored'];

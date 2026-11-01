@@ -71,7 +71,7 @@ test('tsc type-checks a tsconfig in common, apps/server or apps/frontend without
   refused('tsc', ['--noEmit'], 'apps/server', /needs -p <tsconfig>/);
   refused('tsc', ['--noEmit', '-p', 'tsconfig.json'], 'apps/metrics', /runs only in/);
   refused('tsc', ['--noEmit', '-p', 'tsconfig.json'], '.', /runs only in/);
-  for (const option of ['-b', '--build', '--init', '--outDir', '--incremental', '--generateTrace', '--listEmittedFiles', '--plugins', 'src/index.ts']) {
+  for (const option of ['-b', '--build', '--init', '--outDir', '--incremental', '--generateTrace', '--listEmittedFiles', '--listFiles', '--plugins', 'src/index.ts']) {
     refused('tsc', ['--noEmit', '-p', 'tsconfig.json', option], 'apps/server', /tsc option/);
   }
   for (const value of ['../tsconfig.base.json', '/etc/tsconfig.json', 'src/tsconfig.json', 'x.json', '', '-w']) {

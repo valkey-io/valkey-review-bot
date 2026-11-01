@@ -469,9 +469,12 @@ loads graduated skills, assembles the tools and starts the loop.
 
 - Works in the clone baked into the image (`/workspace/valkey`,
   `/workspace/valkey-glide`, `/workspace/valkey-review-bot` or
-  `/workspace/valkey-admin`, cloned with `--filter=blob:limit=1m`). A warm
-  container is reused across runs, so the clone may hold the previous run's
-  state.
+  `/workspace/valkey-admin`, cloned with `--filter=blob:limit=1m`). The
+  invoker passes no `runtimeSessionId` (`handleOne` in
+  `webhook/src/invoker.ts`), so every run gets a new session and a new
+  container from the image. The clone is still reset at the start of each
+  run, so a later change that reuses sessions does not carry one run's
+  state into the next.
 - Reads the pull request. An automatic review (the envelope has a
   `trigger`) stops here when the pull request is no longer open, or is a
   draft and `skip_drafts` is set (`automaticReviewSkipReason`); the run
@@ -600,7 +603,7 @@ remove `lsp`, because their images have no language server.
 | `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB (see below). |
 | `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB (see below). |
 | `build` (valkey-review-bot) | `agents/valkey-review-bot-review/src/tools/build.ts` | `npm run` of `build`, `typecheck` or `test` and `npm test`, with no npm options; `npx tsc --noEmit`; `npx cdk synth -c config=<file>` in `infra` only; `node --test` on test files (`checkBuildArgs` in `build-policy.ts`). npx runs with `--offline --no`, so it never installs a package. No install, publish, deploy or login. Working directory: a package directory inside the checkout. The image installs every package's dependencies from main at image build time. 8 minutes, 1 MB (see below). |
-| `build` (valkey-admin) | `agents/valkey-admin-review/src/tools/build.ts` | `tsc --noEmit -p <tsconfig>`, `vitest run`, `tsx --test` on unit test files under `src/`, `eslint` without `--fix`, `vite build`, and the fixed `tsup` build of `common`, each only in the package directories `checkBuildArgs` (`build-policy.ts`) lists for it, with allowlisted options and no path into a dot directory. Each tool's script starts from the root `node_modules` under the runtime's node, never through npm, so no package script and no lifecycle script runs; the tools still load the checkout's own config and test files. It refuses to run when the checkout tracks files under a `node_modules` or a package directory is a symbolic link. `common/dist` is rebuilt from the checkout before the first command that imports it. No install, publish, package, deploy, server or Electron. The image installs main's dependencies with `npm ci --ignore-scripts`. 8 minutes, 1 MB (see below). |
+| `build` (valkey-admin) | `agents/valkey-admin-review/src/tools/build.ts` | `tsc --noEmit -p <tsconfig>`, `vitest run`, `tsx --test` on unit test files under `src/__tests__/`, `eslint` without `--fix`, `vite build`, and the fixed `tsup` build of `common`, each only in the package directories `checkBuildArgs` (`build-policy.ts`) lists for it, with allowlisted options and no path into a dot directory. Each tool's script starts from the root `node_modules` under the runtime's node, never through npm, so no package script and no lifecycle script runs; the tools still load the checkout's own config and test files. It refuses to run when the checkout tracks files under a `node_modules` or a package directory is a symbolic link. `common/dist` is rebuilt from the checkout before each command that imports it. No install, publish, package, deploy, server or Electron. The image installs main's dependencies with `npm ci --ignore-scripts`. 8 minutes, 1 MB (see below). |
 
 Paths under `tools/` are in `agents/common/src/tools/`. The tool tables in
 each `config/prompt.md` describe the same set to the model.
