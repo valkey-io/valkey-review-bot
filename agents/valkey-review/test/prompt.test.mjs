@@ -85,14 +85,32 @@ test('the prompt describes superseded skill pieces as the reviewer sees them', (
   assert.ok(prompt.indexOf(para) < prompt.indexOf('\nConfidence:\n'));
 });
 
-// Reads the GLIDE reviewer's prompt too, so it needs the whole repository
+// Reads the other reviewers' prompts too, so it needs the whole repository
 // checked out, as CI has it; the reviewer images do not run tests.
 test('the reviewer prompts share the mention and suppressed-skill text', () => {
-  const valkey = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
-  const glide = readFileSync(new URL('../../valkey-glide-review/config/prompt.md', import.meta.url), 'utf8');
+  const read = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  const valkey = read('../config/prompt.md');
+  const glide = read('../../valkey-glide-review/config/prompt.md');
+  const bot = read('../../valkey-review-bot-review/config/prompt.md');
   const section = (prompt) => prompt.slice(prompt.indexOf('## Mention-triggered reviews'), prompt.indexOf('\n## ', prompt.indexOf('## Mention-triggered reviews') + 1));
   // The only intended difference: what a request can single out.
+  assert.ok(section(valkey).includes('a specific file,'));
   assert.equal(section(valkey).replace('a specific file,', 'a specific binding,'), section(glide));
+  assert.equal(section(valkey).replace('a specific file,', 'a specific package,'), section(bot));
   const para = (prompt) => prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.equal(para(valkey), para(glide));
+  assert.equal(para(valkey), para(bot));
+  // The Findings and Status lines stay in sync too, so a change to the
+  // valkey or GLIDE prompt (for example #72 or #73) fails here unless the
+  // bot prompt is updated as well. Two divergences are intentional: the
+  // bot Findings line adds "security regressions", and the bot Status line
+  // omits the backport sentence (the bot repo has no release branches).
+  const line = (prompt, prefix) => prompt.split('\n').find((l) => l.startsWith(prefix));
+  assert.equal(line(glide, '- **Findings.**'), line(valkey, '- **Findings.**'));
+  assert.equal(
+    line(bot, '- **Findings.**'),
+    line(valkey, '- **Findings.**').replace('bugs, broken', 'bugs, security regressions, broken'),
+  );
+  assert.equal(line(glide, '- **Status.**'), line(valkey, '- **Status.**'));
+  assert.equal(line(bot, '- **Status.**') + ' A needed backport does not block.', line(valkey, '- **Status.**'));
 });

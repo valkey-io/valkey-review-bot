@@ -19,7 +19,9 @@ import { createAppSecretSource, fetchRepoInstallation, githubApi, type GitHubApi
  *
  * Env:    SKILLS_REPO ("owner/name"), SKILLS_REPO_APP_SECRET_NAME (a
  *         Secrets Manager secret of the same JSON shape as the main App
- *         secret: app_id and private_key)
+ *         secret: app_id and private_key), MAIN_APP_ID (the main App id)
+ *         and SKILLS_REPO_BOT_REVIEWED ("true" when a route reviews the
+ *         bot repository, so the same app_id is refused)
  * Input:  { purpose?: string }
  * Output: { token, expires_at } or { error }
  */
@@ -109,16 +111,31 @@ export function skillsRepoBrokerFromEnv(
   const repo = required(env, 'SKILLS_REPO');
   const createAuth = opts.createAuth ?? createAppAuth;
   const secrets = createAppSecretSource(secretString);
+  // Synthesis compares secret names only, so two secrets holding the same
+  // App pass it. Refuse at runtime when the bot repository is reviewed
+  // and both secrets belong to the same App id.
+  const mainAppId = env.MAIN_APP_ID?.trim();
+  const botRepoReviewed = (env.SKILLS_REPO_BOT_REVIEWED ?? '').trim().toLowerCase() === 'true';
+  if (botRepoReviewed && !mainAppId) throw new Error('MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true');
   const appAuth = async () => {
     const { appId, privateKey } = await secrets.get();
     if (!appId || !privateKey) throw new Error('skills-repo App secret has no app_id or private_key');
     return createAuth({ appId, privateKey });
   };
-  return createSkillsRepoBroker({
+  const inner = createSkillsRepoBroker({
     repo,
     appApi: async () => githubApi((await (await appAuth())({ type: 'app' })).token, opts.fetch),
     issueToken: async (request) => (await appAuth())({ type: 'installation', ...request }),
   });
+  if (!botRepoReviewed || !mainAppId) return inner;
+  return async (event) => {
+    const { appId } = await secrets.get();
+    if (appId && String(appId) === mainAppId) {
+      console.warn(`[skills-repo-broker] refused repo=${repo}: the skills-repo App is the main App (${mainAppId})`);
+      return { error: 'the skills-repo App must differ from the main App when the bot repository is reviewed' };
+    }
+    return inner(event);
+  };
 }
 
 let broker: ((event: unknown) => Promise<SkillsRepoBrokerResult>) | null = null;
