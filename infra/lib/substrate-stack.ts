@@ -111,6 +111,8 @@ export class SubstrateStack extends cdk.Stack {
       // Synthesis compares secret names, so two secrets holding the same
       // App would pass. The broker compares the app_id values at runtime
       // when the bot repository is reviewed (see skills-repo-broker.ts).
+      // curatorOnlyRoutes run no pull request code, so only routes count
+      // toward whether the bot repository is reviewed.
       const botRepoReviewed = Object.values(props.allowedRepos).flat()
         .some((repo) => repo.toLowerCase() === props.skillsRepo!.repo.toLowerCase());
       const broker = new nodelambda.NodejsFunction(this, 'SkillsRepoTokenBrokerFn', {

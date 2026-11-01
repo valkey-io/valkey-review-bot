@@ -188,6 +188,15 @@ test('refuses the main App id when the bot repository is reviewed', async () => 
     },
   );
   assert.equal((await unreviewed({})).token, TOKEN);
+
+  assert.throws(() => skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, SKILLS_REPO_BOT_REVIEWED: 'true' },
+    async () => secret, { createAuth: fakeAuth().createAuth },
+  ), /MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true/);
+  assert.throws(() => skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, MAIN_APP_ID: '   ', SKILLS_REPO_BOT_REVIEWED: ' True ' },
+    async () => secret, { createAuth: fakeAuth().createAuth },
+  ), /MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true/);
 });
 
 test('the handler needs SKILLS_REPO_APP_SECRET_NAME', async () => {

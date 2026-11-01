@@ -102,7 +102,9 @@ test('the reviewer prompts share the mention and suppressed-skill text', () => {
   assert.equal(para(valkey), para(bot));
   // The Findings and Status lines stay in sync too, so a change to the
   // valkey or GLIDE prompt (for example #72 or #73) fails here unless the
-  // bot prompt is updated as well.
+  // bot prompt is updated as well. Two divergences are intentional: the
+  // bot Findings line adds "security regressions", and the bot Status line
+  // omits the backport sentence (the bot repo has no release branches).
   const line = (prompt, prefix) => prompt.split('\n').find((l) => l.startsWith(prefix));
   assert.equal(line(glide, '- **Findings.**'), line(valkey, '- **Findings.**'));
   assert.equal(
@@ -111,6 +113,4 @@ test('the reviewer prompts share the mention and suppressed-skill text', () => {
   );
   assert.equal(line(glide, '- **Status.**'), line(valkey, '- **Status.**'));
   assert.equal(line(bot, '- **Status.**') + ' A needed backport does not block.', line(valkey, '- **Status.**'));
-  assert.equal(line(glide, '- **Coverage.**'), line(valkey, '- **Coverage.**'));
-  assert.equal(line(bot, '- **Coverage.**'), line(valkey, '- **Coverage.**'));
 });

@@ -450,6 +450,7 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   // request code with reviewer tokens for the bot repository. Those tokens
   // can post reviews and close the curator's skill pull requests. Require
   // an explicit trigger there: a mention or an author allowlist.
+  // curatorOnlyRoutes run no pull request code, so they are exempt here.
   if (skillsRepo) {
     routes.forEach((route, i) => {
       if (route.repo.toLowerCase() === skillsRepo.repo.toLowerCase()

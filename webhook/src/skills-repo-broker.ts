@@ -115,7 +115,8 @@ export function skillsRepoBrokerFromEnv(
   // App pass it. Refuse at runtime when the bot repository is reviewed
   // and both secrets belong to the same App id.
   const mainAppId = env.MAIN_APP_ID?.trim();
-  const botRepoReviewed = env.SKILLS_REPO_BOT_REVIEWED === 'true';
+  const botRepoReviewed = (env.SKILLS_REPO_BOT_REVIEWED ?? '').trim().toLowerCase() === 'true';
+  if (botRepoReviewed && !mainAppId) throw new Error('MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true');
   const appAuth = async () => {
     const { appId, privateKey } = await secrets.get();
     if (!appId || !privateKey) throw new Error('skills-repo App secret has no app_id or private_key');
