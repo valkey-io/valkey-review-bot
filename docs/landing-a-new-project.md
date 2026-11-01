@@ -135,7 +135,9 @@ the tool tables, the review categories, the always-on checks and the examples. K
 `config/skill.md` is the reviewer's built-in knowledge, appended to every system
 prompt. Write it by hand from the project's own guides and from recent maintainer
 review comments. For valkey-search: `AGENTS.md`, `BACKPORTING.md`, `COMPATIBILITY.md`,
-`CONTRIBUTING.md` and `build.sh`.
+`CONTRIBUTING.md` and `build.sh`. The layout, writing rules and checks are in
+[`.agents/skills/writing-reviewer-skills/SKILL.md`](../.agents/skills/writing-reviewer-skills/SKILL.md);
+follow it. The points below are the short form.
 
 - Keep it compact. Write patterns with gates ("Skip unless the PR touches ...") rather
   than general advice.
