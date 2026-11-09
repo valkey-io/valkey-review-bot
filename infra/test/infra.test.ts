@@ -151,7 +151,7 @@ describe('reviewer role', () => {
       'TOKEN_BROKER_FUNCTION', 'UPSTREAM_REPO', 'WORKSPACE_ROOT',
     ]);
     expect(env).toMatchObject({
-      BEDROCK_MODEL_ID: 'us.anthropic.claude-opus-5-5',
+      BEDROCK_MODEL_ID: 'us.anthropic.claude-fable-5-2',
       FALLBACK_MODEL_ID: 'openai.gpt-6.1-sol',
       REASONING_EFFORT: 'high',
       MANTLE_REGION: 'us-east-1',
@@ -220,7 +220,7 @@ describe('curator role', () => {
 
   test('runtime environment carries the curator settings', () => {
     expect(runtimeEnv(s.template(s.stacks.curator))).toMatchObject({
-      BEDROCK_MODEL_ID: 'us.anthropic.claude-opus-5-5',
+      BEDROCK_MODEL_ID: 'us.anthropic.claude-fable-5-2',
       FALLBACK_MODEL_ID: 'openai.gpt-6.1-sol',
       REASONING_EFFORT: 'medium',
       FALLBACK_REASONING_EFFORT: 'high',
@@ -648,16 +648,16 @@ describe('decay', () => {
 });
 
 describe('model grants', () => {
-  const opusProfile = `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-opus-5-5`;
+  const primaryProfile = `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-fable-5-2`;
   const fm = (region: string, model: string) => `arn:aws:bedrock:${region}::foundation-model/${model}`;
 
   test('reviewer: primary and summarizer profiles in every profile region, plus Mantle', () => {
     const statements = reviewerStatements('valkey-review');
     expect(resourceStrings(bySid(statements, 'BedrockInvoke')).sort()).toEqual([
-      fm('us-east-1', 'anthropic.claude-haiku-5-5'), fm('us-east-1', 'anthropic.claude-opus-5-5'),
-      fm('us-east-2', 'anthropic.claude-haiku-5-5'), fm('us-east-2', 'anthropic.claude-opus-5-5'),
-      `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-haiku-5-5`, opusProfile,
-      fm('us-west-2', 'anthropic.claude-haiku-5-5'), fm('us-west-2', 'anthropic.claude-opus-5-5'),
+      fm('us-east-1', 'anthropic.claude-haiku-5-5'), fm('us-east-1', 'anthropic.claude-fable-5-2'),
+      fm('us-east-2', 'anthropic.claude-haiku-5-5'), fm('us-east-2', 'anthropic.claude-fable-5-2'),
+      `arn:aws:bedrock:us-west-2:${ACCOUNT}:inference-profile/us.anthropic.claude-haiku-5-5`, primaryProfile,
+      fm('us-west-2', 'anthropic.claude-haiku-5-5'), fm('us-west-2', 'anthropic.claude-fable-5-2'),
     ].sort());
     expect(actionsOf(bySid(statements, 'BedrockInvoke')[0]!).sort()).toEqual(['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']);
     expect(resourceStrings(bySid(statements, 'BedrockMantleInference')))
@@ -667,7 +667,7 @@ describe('model grants', () => {
 
   test('curator: only its own models', () => {
     const resources = resourceStrings(bySid(curatorStatements(), 'BedrockInvoke'));
-    expect(resources).toContain(opusProfile);
+    expect(resources).toContain(primaryProfile);
     expect(resources.some((r) => r.includes('haiku'))).toBe(false);
   });
 
@@ -714,8 +714,8 @@ describe('model grants', () => {
     const custom = synth({ ...fixture(), models: { profileRegions: ['us-east-1', 'us-east-2'] } });
     const t = custom.template(custom.stacks.curator);
     expect(resourceStrings(bySid(statementsForRole(t, runtimeRoleId(t)), 'BedrockInvoke')).sort()).toEqual([
-      fm('us-east-1', 'anthropic.claude-opus-5-5'), fm('us-east-2', 'anthropic.claude-opus-5-5'),
-      opusProfile, fm('us-west-2', 'anthropic.claude-opus-5-5'),
+      fm('us-east-1', 'anthropic.claude-fable-5-2'), fm('us-east-2', 'anthropic.claude-fable-5-2'),
+      primaryProfile, fm('us-west-2', 'anthropic.claude-fable-5-2'),
     ].sort());
   });
 

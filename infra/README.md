@@ -286,10 +286,10 @@ models.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `reviewer.primary` | `us.anthropic.claude-opus-5-5` | Reviewer model. |
+| `reviewer.primary` | `us.anthropic.claude-fable-5-2` | Reviewer model. |
 | `reviewer.fallback` | `openai.gpt-6.1-sol` | Used when a review is retried after the primary failed. |
 | `reviewer.effort` | `high` | Effort for both reviewer models. One of `low`, `medium`, `high`, `xhigh`, `max`. |
-| `curator.primary` | `us.anthropic.claude-opus-5-5` | Curator model. |
+| `curator.primary` | `us.anthropic.claude-fable-5-2` | Curator model. |
 | `curator.fallback` | `openai.gpt-6.1-sol` | Curator model after a primary failure. |
 | `curator.effort` | `medium` | Effort for `curator.primary`. |
 | `curator.fallbackEffort` | `high` | Effort for `curator.fallback`. |
