@@ -32,8 +32,8 @@ describe('defaults', () => {
     const config = parseDeploymentConfig(fixture());
     expect(config.aws.bootstrapQualifier).toBe('hnb659fds');
     expect(config.models).toEqual({
-      reviewer: { primary: 'us.anthropic.claude-opus-5-5', fallback: 'openai.gpt-6.1-sol', effort: 'high' },
-      curator: { primary: 'us.anthropic.claude-opus-5-5', fallback: 'openai.gpt-6.1-sol', effort: 'medium', fallbackEffort: 'high' },
+      reviewer: { primary: 'us.anthropic.claude-fable-5-2', fallback: 'openai.gpt-6.1-sol', effort: 'high' },
+      curator: { primary: 'us.anthropic.claude-fable-5-2', fallback: 'openai.gpt-6.1-sol', effort: 'medium', fallbackEffort: 'high' },
       summarizer: { primary: 'us.anthropic.claude-haiku-5-5', fallback: 'openai.gpt-6.1-sol' },
       safetyGate: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
       profileRegions: ['us-east-1', 'us-east-2', 'us-west-2'],

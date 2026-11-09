@@ -153,7 +153,7 @@ export interface DeploymentConfig {
   readonly pushReviewDelaySeconds: number;
 }
 
-const DEFAULT_PRIMARY = 'us.anthropic.claude-opus-5-5';
+const DEFAULT_PRIMARY = 'us.anthropic.claude-fable-5-2';
 const DEFAULT_FALLBACK = 'openai.gpt-6.1-sol';
 
 const ACCOUNT = /^\d{12}$/;
