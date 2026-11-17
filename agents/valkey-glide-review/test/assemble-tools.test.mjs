@@ -53,7 +53,7 @@ async function fullToolNames() {
 // The image has no clangd, the only server the common lsp tool starts.
 test('the glide tool set has no lsp, shell or batch tool', async () => {
   assert.deepEqual((await fullToolNames()).sort(), [
-    'build', 'edit', 'gh_api_read', 'git', 'glob', 'grep', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
+    'build', 'edit', 'gh_api_read', 'gh_search', 'git', 'glob', 'grep', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
   ]);
 });
 

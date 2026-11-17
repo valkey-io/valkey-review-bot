@@ -52,7 +52,7 @@ async function fullToolNames() {
 
 test('the valkey tool set has lsp and make but no shell or batch tool', async () => {
   assert.deepEqual((await fullToolNames()).sort(), [
-    'edit', 'gh_api_read', 'git', 'glob', 'grep', 'lsp', 'make', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
+    'edit', 'gh_api_read', 'gh_search', 'git', 'glob', 'grep', 'lsp', 'make', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
   ]);
 });
 

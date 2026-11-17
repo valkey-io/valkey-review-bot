@@ -46,6 +46,11 @@ export const reviewStateSchema = z.object({
     reason: z.string().min(1).describe('One short sentence, e.g. which commit introduced the bug and which release lines carry it.'),
   }),
   direction: z.string().default('').describe('A different approach for the whole PR, only if you checked it against the code and it is clearly better than what the PR does. Empty otherwise.'),
+  related: z.array(z.object({
+    number: z.number().int().positive().describe('The issue or PR number in this repository.'),
+    kind: z.enum(['possible_duplicate', 'related']).describe('"possible_duplicate" when it appears to address the same bug or feature as this PR, checked against its diff or description. "related" when it touches the same code or problem in a way the maintainers may want to see.'),
+    summary: z.string().min(1).describe('One short sentence on the overlap, e.g. "Fixes the same NULL deref in clusterNodeCoversSlot, open since March."'),
+  })).default([]).describe('Other issues and PRs a maintainer should weigh with this one. A flag for maintainers, not a finding: it never blocks. Carry over earlier entries unless shown wrong. Empty when nothing checked out.'),
 });
 
 export type ReviewState = z.infer<typeof reviewStateSchema>;
@@ -53,9 +58,10 @@ export type ReviewState = z.infer<typeof reviewStateSchema>;
 /**
  * Returns an error message when the state contradicts itself, else null.
  * `releaseBranches` are the maintained release lines the workspace found;
- * when known, a "needed" backport may only name those.
+ * when known, a "needed" backport may only name those. `prNumber` is the
+ * PR under review, which `related` may not name.
  */
-export function validateReviewState(state: ReviewState, releaseBranches?: readonly string[] | null): string | null {
+export function validateReviewState(state: ReviewState, releaseBranches?: readonly string[] | null, prNumber?: number): string | null {
   if (state.status === 'ready_for_human_review') {
     const openBlocking = state.findings.filter((f) => f.blocking && !f.resolved);
     if (openBlocking.length > 0) {
@@ -80,6 +86,14 @@ export function validateReviewState(state: ReviewState, releaseBranches?: readon
         return `backport.branches has ${unknown.map((b) => `"${b}"`).join(', ')}, but each entry must be one of ${allowed}.`;
       }
     }
+  }
+  const numbers = state.related.map((r) => r.number);
+  if (prNumber !== undefined && numbers.includes(prNumber)) {
+    return `\`related\` names #${prNumber}, the PR under review. List only other issues and PRs.`;
+  }
+  const repeated = numbers.filter((n, i) => numbers.indexOf(n) !== i);
+  if (repeated.length > 0) {
+    return `\`related\` lists #${repeated[0]} more than once. Give each issue or PR one entry.`;
   }
   return null;
 }
@@ -134,6 +148,16 @@ export function renderReviewState(state: ReviewState, headSha: string, now: Date
 
   if (state.direction.trim()) {
     lines.push('**Direction**', state.direction.trim(), '');
+  }
+
+  if (state.related.length > 0) {
+    // Duplicates first: they are the ones a maintainer acts on.
+    const ordered = [...state.related].sort((a, b) => Number(b.kind === 'possible_duplicate') - Number(a.kind === 'possible_duplicate'));
+    lines.push(`**Related work (${ordered.length})**`);
+    for (const r of ordered) {
+      lines.push(`- ${r.kind === 'possible_duplicate' ? 'Possible duplicate:' : 'Related:'} #${r.number}. ${oneLine(r.summary)}`);
+    }
+    lines.push('');
   }
 
   const stamp = now.toISOString().slice(0, 16).replace('T', ' ');

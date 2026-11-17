@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import './support/ts-resolve.mjs';
 
-const { buildPostReviewTool, buildSkipTool, checkGhApiPath, createTerminalGate, isTerminalCallbackWired, MAX_GITHUB_TEXT_CHARS } = await import('../src/tools/gh.ts');
+const { buildGhSearchTool, buildPostReviewTool, buildSkipTool, checkGhApiPath, checkSearchQuery, MAX_SEARCH_CALLS, createTerminalGate, isTerminalCallbackWired, MAX_GITHUB_TEXT_CHARS } = await import('../src/tools/gh.ts');
 
 const ctx = {
   owner: 'valkey-io', repo: 'valkey', prNumber: 7, headSha: 'abc123',
@@ -236,6 +236,8 @@ test('gh_api_read paths must name an allowed repository and endpoint', () => {
   assert.equal(checkGhApiPath('repos/avalkey/valkey/pulls/12/files?page=2&per_page=100', repos), null);
   assert.equal(checkGhApiPath('repos/Valkey-IO/Valkey/commits/abc123/check-runs', repos), null);
   assert.equal(checkGhApiPath('repos/valkey-io/valkey/contents/src/server.c?ref=9.0', repos), null);
+  assert.equal(checkGhApiPath('repos/valkey-io/valkey/issues/5080', repos), null);
+  assert.match(checkGhApiPath('repos/valkey-io/valkey/issues?state=open', repos), /not on the allowlist/);
 
   assert.match(checkGhApiPath('repos/someone/else/pulls/1', repos), /only these repositories/);
   assert.match(checkGhApiPath('repos/valkey-io/valkey/pulls/1/../../../../user', repos), /"\.\."/);
@@ -245,4 +247,57 @@ test('gh_api_read paths must name an allowed repository and endpoint', () => {
   assert.match(checkGhApiPath('repos/valkey-io/valkey/actions/secrets', repos), /not on the allowlist/);
   assert.match(checkGhApiPath('user/repos', repos), /must start with repos/);
   assert.match(checkGhApiPath('repos/{owner}/{repo}/pulls/1', repos), /only these repositories/);
+});
+
+function searchHarness(items = []) {
+  const requests = [];
+  const octokit = {
+    request: async (route, params) => {
+      requests.push({ route, params });
+      return { data: { total_count: items.length, items } };
+    },
+  };
+  const search = buildGhSearchTool({ ctx, octokit, tokens: { get: async () => 'token' } });
+  return { search, requests };
+}
+
+test('search queries may not pick a repository, owner or org', () => {
+  assert.equal(checkSearchQuery('clusterNodeCoversSlot crash is:pr'), null);
+  assert.equal(checkSearchQuery('"repo: layout" in:title'), null);
+  for (const q of ['repo:other/x crash', 'crash org:other', 'crash user:me', 'x -repo:valkey-io/valkey', '(owner:me)', 'REPO:a/b']) {
+    assert.match(checkSearchQuery(q), /must not name a repo/, q);
+  }
+  assert.match(checkSearchQuery('  '), /empty/);
+  assert.match(checkSearchQuery('a'.repeat(257)), /longer than 256/);
+});
+
+test('gh_search scopes the query to the PR repository and leaves out the PR itself', async () => {
+  const { search, requests } = searchHarness([
+    { number: 7, title: 'This PR', state: 'open', pull_request: {} },
+    { number: 5080, title: 'Fix slot crash', state: 'open', user: { login: 'a' }, labels: [{ name: 'bug' }], body: 'x'.repeat(1000), pull_request: { merged_at: null }, html_url: 'u' },
+    { number: 4213, title: 'Crash in slot', state: 'closed', labels: ['crash'], body: null },
+  ]);
+  const out = JSON.parse(await search.invoke({ query: ' slot crash is:pr ', per_page: 5 }));
+  assert.deepEqual(requests, [{ route: 'GET /search/issues', params: { q: 'slot crash is:pr repo:valkey-io/valkey', per_page: 5, advanced_search: 'true' } }]);
+  assert.deepEqual(out.items.map((i) => [i.number, i.kind, i.merged]), [[5080, 'pr', false], [4213, 'issue', undefined]]);
+  assert.equal(out.items[0].body.length, 400);
+  assert.deepEqual(out.items[0].labels, ['bug']);
+  assert.deepEqual(out.items[1].labels, ['crash']);
+  assert.equal(out.items[1].body, '');
+});
+
+test('gh_search refuses a bad query or a spent budget without calling GitHub', async () => {
+  const { search, requests } = searchHarness();
+  assert.match(await search.invoke({ query: 'repo:x/y crash' }), /^ERROR: nothing was searched/);
+  assert.equal(requests.length, 0);
+  for (let i = 0; i < MAX_SEARCH_CALLS; i++) await search.invoke({ query: `q${i}` });
+  assert.equal(requests.length, MAX_SEARCH_CALLS);
+  assert.match(await search.invoke({ query: 'one more' }), /used its \d+ searches/);
+  assert.equal(requests.length, MAX_SEARCH_CALLS);
+});
+
+test('a failed search is reported to the model', async () => {
+  const octokit = { request: async () => { throw Object.assign(new Error('Validation Failed'), { status: 422 }); } };
+  const search = buildGhSearchTool({ ctx, octokit, tokens: { get: async () => 'token' } });
+  assert.match(await search.invoke({ query: 'crash' }), /^ERROR status=422: the search failed\. Validation Failed/);
 });

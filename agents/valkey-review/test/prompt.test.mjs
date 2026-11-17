@@ -95,4 +95,20 @@ test('the reviewer prompts share the mention and suppressed-skill text', () => {
   assert.equal(section(valkey).replace('a specific file,', 'a specific binding,'), section(glide));
   const para = (prompt) => prompt.split('\n').find((l) => l.startsWith('Some skill pieces, '));
   assert.equal(para(valkey), para(glide));
+  const related = (prompt) => prompt.slice(prompt.indexOf('### Phase 1c: Related work'), prompt.indexOf('### Phase 2:'));
+  assert.equal(related(valkey), related(glide));
+});
+
+test('the related-work phase searches, checks, and flags without acting on other PRs', () => {
+  const prompt = readFileSync(new URL('../config/prompt.md', import.meta.url), 'utf8');
+  const start = prompt.indexOf('### Phase 1c: Related work');
+  assert.ok(start > prompt.indexOf('### Phase 1b:') && start < prompt.indexOf('### Phase 2:'));
+  const phase = prompt.slice(start, prompt.indexOf('### Phase 2:'));
+  for (const kind of ['`possible_duplicate`', '`related`']) assert.ok(phase.includes(kind), kind);
+  assert.match(phase, /`gh_search`/);
+  assert.match(phase, /A title match is a lead, not evidence\./);
+  assert.match(phase, /never blocks and does not change `status`/);
+  assert.match(phase, /You cannot close, label, or comment on other issues and PRs\./);
+  // The state section carries entries over like findings.
+  assert.ok(prompt.split('\n').some((l) => l.startsWith('- **Related.** Carry over the `related` entries')));
 });

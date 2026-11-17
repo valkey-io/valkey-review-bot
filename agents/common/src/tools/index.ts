@@ -5,7 +5,7 @@ import type { TokenSource } from '../github-auth.js';
 import { createStateCommentWriter } from '../review-state.js';
 import { buildHarnessTools } from './harness.js';
 import { buildGitTool } from './git.js';
-import { buildGhApiReadTool, buildPostReviewTool, buildSkipTool, createTerminalGate, type GhToolsDeps, type TerminalToolName } from './gh.js';
+import { buildGhApiReadTool, buildGhSearchTool, buildPostReviewTool, buildSkipTool, createTerminalGate, type GhToolsDeps, type TerminalToolName } from './gh.js';
 
 export interface CommonToolsOpts {
   readonly ctx: PrContext;
@@ -23,7 +23,8 @@ export interface CommonToolsOpts {
 
 /**
  * Build the review-agent-agnostic tool set: harness read/grep/glob/lsp
- * (+ write/edit when allowed), read-only git, GitHub REST read, and
+ * (+ write/edit when allowed), read-only git, GitHub REST read and
+ * issue/PR search, and
  * post_review / skip_review.
  *
  * Per-agent code composes this with its own build/run tools (make for valkey;
@@ -48,6 +49,7 @@ export async function assembleCommonTools(opts: CommonToolsOpts): Promise<readon
     ...harness.tools,
     buildGitTool({ workspaceRoot: opts.ctx.workspacePath }),
     buildGhApiReadTool(ghDeps),
+    buildGhSearchTool(ghDeps),
     buildPostReviewTool(ghDeps),
     buildSkipTool(ghDeps),
   ];
@@ -56,5 +58,5 @@ export async function assembleCommonTools(opts: CommonToolsOpts): Promise<readon
 // Re-exports so agents can import everything through the common barrel.
 export { buildHarnessTools } from './harness.js';
 export { buildGitTool } from './git.js';
-export { buildGhApiReadTool, buildPostReviewTool, buildSkipTool, createTerminalGate } from './gh.js';
+export { buildGhApiReadTool, buildGhSearchTool, buildPostReviewTool, buildSkipTool, createTerminalGate } from './gh.js';
 export type { GhToolsDeps, TerminalGate, TerminalToolName } from './gh.js';

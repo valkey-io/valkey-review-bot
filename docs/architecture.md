@@ -594,7 +594,8 @@ no language server.
 | `lsp` (Valkey) | `tools/harness.ts` | clangd for `.c` and `.h`, from a fixed manifest. A `.lsp.json` in the checkout is ignored. There is no compilation database, so `references` and `workspaceSymbol` cover only the files clangd has opened and the headers they include; the prompt finds callers with `git grep`. |
 | `write`, `edit`, `multi_edit` | `tools/harness.ts` | Only when `ALLOW_WRITE` is true; workspace files only. A target whose real location (the realpath of its nearest existing ancestor) is outside the workspace or matches the refused patterns, for example `.git/` reached through a symlink, is refused. For testing assumptions; nothing is committed or pushed, and the next run resets the tree. |
 | `git` | `tools/git.ts` | Read-only subcommands (`log`, `show`, `blame`, `diff`, `status`, `rev-parse`, `rev-list`, `cat-file`, `ls-tree`, `ls-files`, `grep`, `shortlog`, `describe`, `branch`, `tag`, `reflog`, `merge-base`, `name-rev`). `checkGitArgs` rejects options that write files, run helpers or pagers, read files outside the repository, or override config (`-c`); `git diff` refuses absolute paths and paths that climb out with `..`; `branch` and `tag` only list and `reflog` only reads. `--no-ext-diff` and `--no-textconv` are added. No credentials, no system or global gitconfig (`GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL=/dev/null`), 60 seconds, 500 KB. |
-| `gh_api_read` | `tools/gh.ts` | `GET` through `gh api`, only under `repos/<PR repository or upstream>/`, only for allowlisted pull request, review, comment, commit, contents and check-run endpoints (`checkGhApiPath`). Paths with `..`, `%`, backslashes, whitespace or `#` are refused. 30 seconds, 2 MB. |
+| `gh_api_read` | `tools/gh.ts` | `GET` through `gh api`, only under `repos/<PR repository or upstream>/`, only for allowlisted pull request, issue, review, comment, commit, contents and check-run endpoints (`checkGhApiPath`). Paths with `..`, `%`, backslashes, whitespace or `#` are refused. 30 seconds, 2 MB. |
+| `gh_search` | `tools/gh.ts` | `GET /search/issues` through the installation's Octokit. The tool appends `repo:<PR repository>` to every query and refuses queries that name a `repo:`, `org:`, `user:` or `owner:` (`checkSearchQuery`). At most 30 results a call and `MAX_SEARCH_CALLS` (8) calls a run, below GitHub's 30 searches a minute. Results leave out the PR under review and carry the first 400 characters of each body. Used by Phase 1c to find related and duplicate work; it cannot write, so the bot never closes or comments on what it finds. |
 | `post_review`, `skip_review` | `tools/gh.ts` | Terminal tools, described below. |
 | `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB (see below). |
 | `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB (see below). |
@@ -615,6 +616,7 @@ Both reviewer prompts follow the same workflow headings:
 
 - Phase 1: Orient (at most 5 tool calls)
 - Phase 1b: Question the approach
+- Phase 1c: Related work
 - Phase 2: Select candidate claims
 - Phase 3: Gather evidence
 - Phase 4: Experiment
@@ -661,11 +663,17 @@ model fills `reviewStateSchema`:
   previous state are carried forward;
 - `backport`: `verdict` (`needed`, `not_needed`, `unclear`), `branches`,
   `reason`;
-- `direction`: an alternative approach, or empty.
+- `direction`: an alternative approach, or empty;
+- `related`: other issues and PRs in the repository, each `number`, `kind`
+  (`possible_duplicate` or `related`) and `summary`. Rendered as "Related
+  work", duplicates first, as `#N` references so GitHub links both ways. It
+  never affects `status`.
 
 `validateReviewState` rejects `ready_for_human_review` with open blocking
 findings or a non-empty `direction`, and a `needed` backport with no branches
 or with branches outside the maintained release lines found for this run.
+It also rejects a `related` list that names the PR under review or names one
+number twice.
 `renderReviewState` produces the comment, so its shape is the same across runs
 and models. `createStateCommentWriter` edits the previous comment, or creates
 a new one when the old one returns 404 or a 403 that is not rate limiting; a

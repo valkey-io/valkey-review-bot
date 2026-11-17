@@ -19,6 +19,7 @@ const GH_API_READ_PATTERNS: ReadonlyArray<RegExp> = [
   /^pulls\/\d+\/reviews\/\d+$/,
   /^pulls\/\d+\/comments(\?.*)?$/,
   /^pulls\/\d+\/commits(\?.*)?$/,
+  /^issues\/\d+$/,
   /^issues\/\d+\/comments(\?.*)?$/,
   /^commits\/[a-f0-9]+$/,
   /^contents\/.+/,
@@ -136,7 +137,7 @@ function readableRepos(ctx: PrContext): string[] {
 }
 
 function checkState(deps: GhToolsDeps, state: ReviewState): string | null {
-  return validateReviewState(state, deps.ctx.releaseLines?.map((r) => r.branch) ?? null)
+  return validateReviewState(state, deps.ctx.releaseLines?.map((r) => r.branch) ?? null, deps.ctx.prNumber)
     ?? tooLong('The rendered review state', renderReviewState(state, deps.ctx.headSha));
 }
 
@@ -183,6 +184,7 @@ export function buildGhApiReadTool(deps: GhToolsDeps) {
 - repos/OWNER/REPO/pulls/NUMBER/reviews/ID: single review
 - repos/OWNER/REPO/pulls/NUMBER/comments: inline review comments
 - repos/OWNER/REPO/pulls/NUMBER/commits: PR commits
+- repos/OWNER/REPO/issues/NUMBER: issue (or PR) title, body, state, labels
 - repos/OWNER/REPO/issues/NUMBER/comments: issue/PR comments
 - repos/OWNER/REPO/commits/SHA: commit
 - repos/OWNER/REPO/contents/PATH: file at ref
@@ -206,6 +208,94 @@ Do NOT include a leading slash. Append query strings inline, e.g. \`repos/OWNER/
       if (r.truncated) return `${r.out}\nThe response was cut at 2 MB. Ask for a smaller page with per_page and page.`;
       if (r.code !== 0) return `gh api failed (${r.code}): ${r.err}\n${r.out}`;
       return r.out;
+    },
+  });
+}
+
+/** Search calls one run may make; GitHub allows 30 search requests a minute. */
+export const MAX_SEARCH_CALLS = 8;
+
+/** Characters of each result's body the search tool returns. */
+const SEARCH_BODY_CHARS = 400;
+
+/**
+ * Returns why `query` may not be searched, or null. The tool scopes every
+ * query to the PR's repository, so a qualifier that picks another
+ * repository, owner or org is refused rather than silently overridden.
+ */
+export function checkSearchQuery(query: string): string | null {
+  if (!query.trim()) return 'the query is empty.';
+  if (query.length > 256) return 'the query is longer than 256 characters.';
+  if (/(^|[\s(])-?(repo|org|user|owner):/i.test(query)) return 'the query must not name a repo, org, user or owner; the tool adds the repository itself.';
+  return null;
+}
+
+interface SearchItem {
+  number: number;
+  title: string;
+  state: string;
+  user?: { login?: string } | null;
+  labels?: ReadonlyArray<{ name?: string } | string>;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string | null;
+  html_url?: string;
+  body?: string | null;
+  pull_request?: { merged_at?: string | null } | null;
+}
+
+/**
+ * Search issues and pull requests in the PR's repository, to find work
+ * related to the PR or duplicating it. Read-only: the tool only lists.
+ */
+export function buildGhSearchTool(deps: GhToolsDeps) {
+  const repo = `${deps.ctx.owner}/${deps.ctx.repo}`;
+  let calls = 0;
+  return tool({
+    name: 'gh_search',
+    description:
+`Search issues and pull requests in ${repo} with GitHub's issue search syntax. Read-only. The tool adds \`repo:${repo}\` to every query, so do not name a repo, org, user or owner.
+
+Use keywords plus qualifiers, e.g. \`clusterNodeCoversSlot crash is:pr\`, \`"slot migration" in:title is:issue is:open\`, \`5080 is:pr\` (PRs that mention #5080). Results are sorted by best match and never include this PR. Each result has number, kind (pr or issue), state, merged, title, author, labels, dates, url and the start of the body. Read a result in full with gh_api_read (\`issues/N\`, \`pulls/N\`, \`pulls/N/files\`).
+
+At most ${MAX_SEARCH_CALLS} calls per run.`,
+    inputSchema: z.object({
+      query: z.string().describe('Search keywords and qualifiers, without repo:/org:/user:.'),
+      per_page: z.number().int().min(1).max(30).default(15).describe('Results to return, 1-30.'),
+    }),
+    callback: async (input: { query: string; per_page?: number }) => {
+      const problem = checkSearchQuery(input.query);
+      if (problem) return `ERROR: nothing was searched: ${problem}`;
+      if (calls >= MAX_SEARCH_CALLS) return `ERROR: nothing was searched: this run has used its ${MAX_SEARCH_CALLS} searches. Work with the results you have.`;
+      calls++;
+      try {
+        const resp = await deps.octokit.request('GET /search/issues', {
+          q: `${input.query.trim()} repo:${repo}`,
+          per_page: input.per_page ?? 15,
+          advanced_search: 'true',
+        });
+        const data = resp.data as { total_count: number; items: SearchItem[] };
+        const items = data.items
+          .filter((it) => it.number !== deps.ctx.prNumber)
+          .map((it) => ({
+            number: it.number,
+            kind: it.pull_request ? 'pr' : 'issue',
+            state: it.state,
+            ...(it.pull_request ? { merged: Boolean(it.pull_request.merged_at) } : {}),
+            title: it.title,
+            author: it.user?.login ?? null,
+            labels: (it.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name ?? '')).filter(Boolean),
+            created_at: it.created_at ?? null,
+            updated_at: it.updated_at ?? null,
+            closed_at: it.closed_at ?? null,
+            url: it.html_url ?? null,
+            body: (it.body ?? '').slice(0, SEARCH_BODY_CHARS),
+          }));
+        return JSON.stringify({ total_count: data.total_count, items });
+      } catch (err) {
+        const e = err as { status?: number; message?: string } | null;
+        return `ERROR status=${e?.status ?? '?'}: the search failed. ${e?.message ?? String(err)}`;
+      }
     },
   });
 }

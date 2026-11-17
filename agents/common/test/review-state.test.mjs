@@ -69,6 +69,26 @@ test('the rendered comment starts with the marker and lists open and resolved fi
   assert.match(ready, /\*\*Backport:\*\* Not needed\. New feature\./);
 });
 
+test('related work renders duplicates first and never touches the status', () => {
+  const related = [
+    { number: 4213, kind: 'related', summary: 'Touches the same slot check.' },
+    { number: 5080, kind: 'possible_duplicate', summary: 'Open since March,\nfixes the same crash.' },
+  ];
+  const body = renderReviewState(state({ related }), 'abc');
+  assert.match(body, /\*\*Related work \(2\)\*\*\n- Possible duplicate: #5080\. Open since March, fixes the same crash\.\n- Related: #4213\. Touches the same slot check\./);
+  assert.ok(body.indexOf('**Related work') > body.indexOf('**Backport:**'));
+  assert.doesNotMatch(renderReviewState(state(), 'abc'), /Related work/);
+  // A possible duplicate is a flag, not a finding.
+  assert.equal(validateReviewState(state({ status: 'ready_for_human_review', findings: [], related })), null);
+});
+
+test('related work may not name the PR under review or one PR twice', () => {
+  const related = (numbers) => state({ related: numbers.map((number) => ({ number, kind: 'related', summary: 's' })) });
+  assert.equal(validateReviewState(related([5080, 4213]), null, 3), null);
+  assert.match(validateReviewState(related([5080, 3]), null, 3), /names #3, the PR under review/);
+  assert.match(validateReviewState(related([5080, 4213, 5080])), /lists #5080 more than once/);
+});
+
 test('the marker is stripped from model-written text, even when nested', () => {
   assert.equal(stripStateMarker(`${STATE_MARKER}\nFixed.`), '\nFixed.');
   assert.equal(stripStateMarker(`a ${STATE_MARKER} b ${STATE_MARKER}`), 'a  b ');
