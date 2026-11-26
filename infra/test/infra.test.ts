@@ -214,6 +214,13 @@ describe('reviewer role', () => {
     });
   });
 
+  test('a reviewer that runs no pull request code gets ALLOW_BUILD false', () => {
+    expect(runtimeEnv(reviewerTemplate('valkey-review-bot-review'))).toMatchObject({ ALLOW_BUILD: 'false', ALLOW_WRITE: 'true' });
+    for (const id of ['valkey-review', 'valkey-glide-review', 'valkey-admin-review'] as const) {
+      expect(runtimeEnv(reviewerTemplate(id)).ALLOW_BUILD).toBe('true');
+    }
+  });
+
   test('the runtime is created after its role policy', () => {
     const t = reviewerTemplate('valkey-review');
     const runtime = Object.values<any>(t.findResources('AWS::BedrockAgentCore::Runtime'))[0];
@@ -392,19 +399,31 @@ describe('skills repository', () => {
         MAIN_APP_ID: '123456',
         SKILLS_REPO_BOT_REVIEWED: 'false',
       });
-    const reviewed = synth({
+    // Only a reviewer that runs pull request code makes the bot repository
+    // count as reviewed: valkey-review-bot-review runs none.
+    const botRoute = (reviewer: string) => synth({
       ...fixture(),
       skillsRepo: { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' },
-      routes: [...fixture().routes, {
-        id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot',
-        mentionOnly: true,
-      }],
+      routes: [...fixture().routes, { id: 'bot-review', reviewer, repo: 'example-org/valkey-review-bot', mentionOnly: true }],
     });
-    expect(functionEnv(reviewed.template(reviewed.stacks.substrate), 'SkillsRepoTokenBrokerFn')).toEqual({
+    const brokerEnv = (s: ReturnType<typeof synth>) => functionEnv(s.template(s.stacks.substrate), 'SkillsRepoTokenBrokerFn');
+    expect(brokerEnv(botRoute('valkey-admin-review'))).toEqual({
       SKILLS_REPO: 'example-org/valkey-review-bot',
       SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app',
       MAIN_APP_ID: '123456',
       SKILLS_REPO_BOT_REVIEWED: 'true',
+    });
+    expect(brokerEnv(botRoute('valkey-review-bot-review')).SKILLS_REPO_BOT_REVIEWED).toBe('false');
+    const mainApp = synth({
+      ...fixture(),
+      skillsRepo: { repo: 'example-org/valkey-review-bot' },
+      routes: [...fixture().routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot', mentionOnly: true }],
+    });
+    expect(brokerEnv(mainApp)).toEqual({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_APP_SECRET_NAME: 'example/github-app',
+      MAIN_APP_ID: '123456',
+      SKILLS_REPO_BOT_REVIEWED: 'false',
     });
   });
 

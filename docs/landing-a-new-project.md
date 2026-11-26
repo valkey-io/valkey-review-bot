@@ -38,7 +38,7 @@ together, and [infra/README.md](../infra/README.md) documents every deployment s
 ## 2. The reviewer id in the code
 
 `REVIEWER_IDS` in `infra/lib/deployment-config.ts` is a closed list. Add the id there,
-then run `npm run typecheck` in `infra/`. TypeScript flags the four other places that
+then run `npm run typecheck` in `infra/`. TypeScript flags the five other places that
 list every id:
 
 1. the `skillsRegistries` object in `parseDeploymentConfig`: add
@@ -47,7 +47,11 @@ list every id:
    default upstream, `fallback: 'valkey-io/valkey-search'`;
 3. the object `parseAgents` returns: add `'valkey-search-review': reviewer('valkey-search-review')`;
 4. `REVIEWERS` in `infra/lib/app.ts`: `stackId: 'ValkeySearchReviewAgent'`,
-   `workspaceRoot: '/workspace/valkey-search'` and a one-line `description`.
+   `workspaceRoot: '/workspace/valkey-search'` and a one-line `description`;
+5. `REVIEWER_RUNS_PULL_REQUEST_CODE` in `infra/lib/deployment-config.ts`: `true` when
+   the reviewer has a build tool, which runs pull request code. Only a reviewer set to
+   `false` may review the bot repository while the main App also serves `skillsRepo`,
+   and a test checks that such a reviewer's `src/tools/index.ts` wires no build tool.
 
 Everything else follows the id, with no code change:
 
@@ -73,8 +77,8 @@ registry for it. Tell the other operators before the change merges.
 
 Copy the closest reviewer. `agents/valkey-review` fits a C or C++ project,
 `agents/valkey-glide-review` a project with several language toolchains,
-`agents/valkey-review-bot-review` a TypeScript project of npm packages whose
-image installs their dependencies at build time, and `agents/valkey-admin-review`
+`agents/valkey-review-bot-review` a reviewer that runs no pull request code (no build
+tool, no dependencies in its clone), and `agents/valkey-admin-review`
 a single npm workspace whose content is untrusted: its build tool starts each
 tool from `node_modules` without npm, so no package or lifecycle script runs. For
 valkey-search, copy `agents/valkey-review` to `agents/valkey-search-review`.
@@ -352,7 +356,7 @@ Between releases, check the file yourself with `scripts/skill-facts.mjs` (sectio
 
 ## 10. Known friction
 
-- `ReviewerId` is a closed union, and five places in `infra/lib` list every id.
+- `ReviewerId` is a closed union, and six places in `infra/lib` list every id.
 - Every id in `REVIEWER_IDS` is always deployed (image, runtime, broker, table) and
   needs a registry, even with no route.
 - All images share one build context, the repository root, so any agent change

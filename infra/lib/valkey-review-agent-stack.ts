@@ -10,7 +10,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import { modelAccessStatements } from './bedrock-arns';
-import type { ModelsConfig, ReviewerAgentConfig, ReviewerId } from './deployment-config';
+import { type ModelsConfig, REVIEWER_RUNS_PULL_REQUEST_CODE, type ReviewerAgentConfig, type ReviewerId } from './deployment-config';
 import { createRuntimeRole, registryResources } from './grants';
 
 /**
@@ -167,7 +167,9 @@ export class ValkeyReviewAgentStack extends cdk.Stack {
         MAX_TOKENS: String(props.agent.maxTokens),
         WORKSPACE_ROOT: props.workspaceRoot,
         ALLOW_WRITE: String(props.agent.allowWrite),
-        ALLOW_BUILD: String(props.agent.allowBuild),
+        // A reviewer that runs no pull request code has no build tool,
+        // so ALLOW_BUILD is false for it whatever allowBuild says.
+        ALLOW_BUILD: String(props.agent.allowBuild && REVIEWER_RUNS_PULL_REQUEST_CODE[props.agentId]),
         UPSTREAM_REPO: props.upstreamRepo,
       },
     });

@@ -1,7 +1,5 @@
 import { assembleCommonTools } from '../../../common/src/tools/index.js';
 import type { AssembleBaseOpts } from '../../../common/src/run-agent.js';
-import { buildReviewBotBuildTool } from './build.js';
-import { buildToolEnabled } from './build-policy.js';
 
 /**
  * The common lsp tool starts clangd and nothing else. This image does not
@@ -13,9 +11,14 @@ function isLspTool(t: unknown): boolean {
 }
 
 /**
- * valkey-review-bot-review tool set: the common tools without lsp, plus,
- * when ALLOW_BUILD is set, one build tool covering npm, npx and node --test
- * with allowlisted actions.
+ * valkey-review-bot-review tool set: the common tools without lsp.
+ *
+ * There is no build tool, whatever agents.<id>.allowBuild says. This
+ * reviewer reviews the bot's own repository, and code from a pull request
+ * there must never run in its container. Scrubbing the environment is not a sandbox: that
+ * code could read the agent process, reach the runtime's credentials and
+ * use the network. infra/lib/deployment-config.ts relies on this
+ * (REVIEWER_RUNS_PULL_REQUEST_CODE).
  */
 export async function assembleTools(opts: AssembleBaseOpts): Promise<readonly unknown[]> {
   const common = await assembleCommonTools({
@@ -26,11 +29,5 @@ export async function assembleTools(opts: AssembleBaseOpts): Promise<readonly un
     statusComment: opts.statusComment,
     onTerminal: opts.onTerminal,
   });
-
-  const extras: unknown[] = [];
-  if (buildToolEnabled(process.env)) {
-    extras.push(buildReviewBotBuildTool({ workspaceRoot: opts.ctx.workspacePath }));
-  }
-
-  return [...common.filter((t) => !isLspTool(t)), ...extras];
+  return common.filter((t) => !isLspTool(t));
 }

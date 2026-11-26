@@ -9,7 +9,7 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as nodelambda from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as path from 'node:path';
-import type { GitHubConfig, ReviewerId, SkillsRepoConfig } from './deployment-config';
+import { type GitHubConfig, REVIEWER_RUNS_PULL_REQUEST_CODE, type ReviewerId, type SkillsRepoConfig } from './deployment-config';
 
 export interface SubstrateStackProps extends cdk.StackProps {
   readonly github: Pick<GitHubConfig, 'appId' | 'appSecretName'>;
@@ -110,10 +110,13 @@ export class SubstrateStack extends cdk.Stack {
       const secretName = props.skillsRepo.appSecretName;
       // Synthesis compares secret names, so two secrets holding the same
       // App would pass. The broker compares the app_id values at runtime
-      // when the bot repository is reviewed (see skills-repo-broker.ts).
-      // curatorOnlyRoutes run no pull request code, so only routes count
-      // toward whether the bot repository is reviewed.
-      const botRepoReviewed = Object.values(props.allowedRepos).flat()
+      // when a reviewer that runs pull request code reviews the bot
+      // repository (see skills-repo-broker.ts). Reviewers that run none
+      // (REVIEWER_RUNS_PULL_REQUEST_CODE) and curatorOnlyRoutes do not
+      // count, so the main App may serve the bot repository for them.
+      const botRepoReviewed = (Object.entries(props.allowedRepos) as [ReviewerId, readonly string[]][])
+        .filter(([reviewerId]) => REVIEWER_RUNS_PULL_REQUEST_CODE[reviewerId] !== false)
+        .flatMap(([, repos]) => repos)
         .some((repo) => repo.toLowerCase() === props.skillsRepo!.repo.toLowerCase());
       const broker = new nodelambda.NodejsFunction(this, 'SkillsRepoTokenBrokerFn', {
         entry: path.join(webhookRoot, 'src', 'skills-repo-broker.ts'),

@@ -8,6 +8,8 @@ import {
   parseDeploymentConfig,
   resolveConfigPath,
   REVIEWER_IDS,
+  REVIEWER_RUNS_PULL_REQUEST_CODE,
+  type ReviewerId,
   tokenBrokerRepos,
 } from '../lib/deployment-config';
 import { ACCOUNT, fixture } from './helpers';
@@ -513,29 +515,70 @@ describe('skillsRepo', () => {
     expect(problems(withSkillsRepo({ repo: 'example-org/x', branch: 'main' }))).toContain('skillsRepo.branch is not a known setting');
   });
 
-  test('a review route on the bot repository needs a skills App of its own', () => {
-    const routeTo = (repo: string, appSecretName?: string) => withChange((raw) => {
+  test('with the main App, only a reviewer that runs no pull request code may review the bot repository', () => {
+    const routeTo = (reviewer: string, repo: string, appSecretName?: string) => withChange((raw) => {
       raw.skillsRepo = { repo: 'example-org/valkey-review-bot', ...(appSecretName ? { appSecretName } : {}) };
-      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo, mentionOnly: true }];
+      raw.routes = [...raw.routes, { id: 'bot-review', reviewer, repo, mentionOnly: true }];
     });
-    const message = "skillsRepo.appSecretName is the main App's secret, but routes review example-org/valkey-review-bot. Give skillsRepo an App of its own (infra/README.md, \"The skills-repo App\")";
-    expect(problems(routeTo('example-org/valkey-review-bot'))).toContain(message);
-    expect(problems(routeTo('Example-Org/Valkey-Review-Bot'))).toContain(message);
-    expect(problems(routeTo('example-org/valkey-review-bot', 'example/github-app'))).toContain(message);
-    expect(parseDeploymentConfig(routeTo('example-org/valkey-review-bot', 'example/skills-app')).skillsRepo?.appSecretName).toBe('example/skills-app');
-    expect(parseDeploymentConfig(routeTo('example-org/other')).skillsRepo?.appSecretName).toBe('example/github-app');
+    const refusal = (reviewer: string) => `routes[3].reviewer is ${reviewer}, which runs pull request code, and it reviews example-org/valkey-review-bot while skillsRepo uses the main App's secret. Route a reviewer that runs no pull request code there, or give skillsRepo an App of its own (infra/README.md, "The skills-repo App")`;
+    expect(fixture().routes).toHaveLength(3);
+
+    // valkey-review-bot-review runs no pull request code, so the main App may serve it.
+    expect(REVIEWER_RUNS_PULL_REQUEST_CODE['valkey-review-bot-review']).toBe(false);
+    for (const config of [
+      routeTo('valkey-review-bot-review', 'example-org/valkey-review-bot'),
+      routeTo('valkey-review-bot-review', 'Example-Org/Valkey-Review-Bot'),
+      routeTo('valkey-review-bot-review', 'example-org/valkey-review-bot', 'example/github-app'),
+    ]) {
+      const parsed = parseDeploymentConfig(config);
+      expect(parsed.skillsRepo?.appSecretName).toBe('example/github-app');
+      expect(parsed.routes.at(-1)).toMatchObject({ reviewer: 'valkey-review-bot-review', mentionOnly: true });
+    }
+
+    // A reviewer that runs pull request code is still refused there with the main App.
+    for (const reviewer of REVIEWER_IDS.filter((id) => REVIEWER_RUNS_PULL_REQUEST_CODE[id])) {
+      expect(problems(routeTo(reviewer, 'example-org/valkey-review-bot'))).toContain(refusal(reviewer));
+      expect(problems(routeTo(reviewer, 'Example-Org/Valkey-Review-Bot'))).toContain(refusal(reviewer));
+      expect(problems(routeTo(reviewer, 'example-org/valkey-review-bot', 'example/github-app'))).toContain(refusal(reviewer));
+      // An App of its own for skillsRepo, or another repository, is accepted.
+      expect(parseDeploymentConfig(routeTo(reviewer, 'example-org/valkey-review-bot', 'example/skills-app')).skillsRepo?.appSecretName)
+        .toBe('example/skills-app');
+      expect(parseDeploymentConfig(routeTo(reviewer, 'example-org/other')).skillsRepo?.appSecretName).toBe('example/github-app');
+    }
+    expect(REVIEWER_IDS.filter((id) => REVIEWER_RUNS_PULL_REQUEST_CODE[id])).toEqual(['valkey-review', 'valkey-glide-review', 'valkey-admin-review']);
   });
+
+  // REVIEWER_RUNS_PULL_REQUEST_CODE is a claim about the code. A reviewer
+  // marked false must not wire in a build tool.
+  const BUILD_TOOL_WIRING = /buildToolEnabled|ALLOW_BUILD|\.\/(?:build|make)(?:-policy)?\.js/;
+  const toolsDir = (id: ReviewerId) => path.join(__dirname, '..', '..', 'agents', id, 'src', 'tools');
+  test.each(REVIEWER_IDS.filter((id) => REVIEWER_RUNS_PULL_REQUEST_CODE[id]))('%s, marked as running pull request code, wires a build tool', (id) => {
+    expect(fs.readFileSync(path.join(toolsDir(id), 'index.ts'), 'utf8')).toMatch(BUILD_TOOL_WIRING);
+  });
+  test.each(REVIEWER_IDS.filter((id) => !REVIEWER_RUNS_PULL_REQUEST_CODE[id]))(
+    '%s, marked as running no pull request code, has no build tool', (id) => {
+      const tools = toolsDir(id);
+      expect(fs.readFileSync(path.join(tools, 'index.ts'), 'utf8')).not.toMatch(BUILD_TOOL_WIRING);
+      expect(fs.readdirSync(tools).filter((f) => /^(?:build|make)(?:-policy)?\.ts$/.test(f))).toEqual([]);
+    });
 
   test('a route on the bot repository needs an explicit trigger', () => {
     const routeTo = (extra: object) => withChange((raw) => {
       raw.skillsRepo = { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' };
       raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot', ...extra }];
     });
-    const message = 'reviews example-org/valkey-review-bot automatically, so pull request code there runs with reviewer tokens. Set mentionOnly or authorAllowlist for this route';
+    const message = 'reviews example-org/valkey-review-bot automatically, so any pull request there starts a run with reviewer tokens for it. Set mentionOnly or authorAllowlist for this route';
     expect(problems(routeTo({}))).toContain(message);
     expect(problems(routeTo({ mentionOnly: false, authorAllowlist: [] }))).toContain(message);
     expect(parseDeploymentConfig(routeTo({ mentionOnly: true })).routes.at(-1)?.mentionOnly).toBe(true);
     expect(parseDeploymentConfig(routeTo({ authorAllowlist: ['some-maintainer'] })).routes.at(-1)?.authorAllowlist).toEqual(['some-maintainer']);
+    // The trigger is required with the main App too.
+    const mainApp = (extra: object) => withChange((raw) => {
+      raw.skillsRepo = { repo: 'example-org/valkey-review-bot' };
+      raw.routes = [...raw.routes, { id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot', ...extra }];
+    });
+    expect(problems(mainApp({}))).toContain(message);
+    expect(parseDeploymentConfig(mainApp({ authorAllowlist: ['some-maintainer'] })).skillsRepo?.appSecretName).toBe('example/github-app');
     // Other repositories keep automatic reviews.
     expect(parseDeploymentConfig(withChange((raw) => {
       raw.skillsRepo = { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' };

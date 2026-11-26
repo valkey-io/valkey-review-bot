@@ -588,9 +588,13 @@ model copied cannot start a heading there.
 ### Tools
 
 There is no shell tool. `assembleCommonTools` (`agents/common/src/tools/index.ts`)
-builds the common set, and each reviewer adds its build tool when
-`ALLOW_BUILD` is true. The GLIDE, valkey-review-bot and valkey-admin reviewers
-remove `lsp`, because their images have no language server.
+builds the common set, and the Valkey, GLIDE and valkey-admin reviewers add
+their build tool when `ALLOW_BUILD` is true. The valkey-review-bot reviewer
+has no build tool: it reviews the bot's own repository and never runs code
+from a pull request (`REVIEWER_RUNS_PULL_REQUEST_CODE` in
+`infra/lib/deployment-config.ts`), so its runtime gets `ALLOW_BUILD=false`.
+The GLIDE, valkey-review-bot and valkey-admin reviewers remove `lsp`, because
+their images have no language server.
 
 | Tool | Code | What it is limited to |
 | --- | --- | --- |
@@ -602,7 +606,6 @@ remove `lsp`, because their images have no language server.
 | `post_review`, `skip_review` | `tools/gh.ts` | Terminal tools, described below. |
 | `make` (Valkey) | `agents/valkey-review/src/tools/make.ts` | Targets `all`, `valkey-server`, `valkey-cli`, `valkey-benchmark`, `valkey-sentinel`, `test-unit`, `clean`, `Makefile.dep`; an allowlist of variables with a restricted character set; `-j` 1 to 16; run from the repository root or `src/`. 8 minutes, 1 MB (see below). |
 | `build` (GLIDE) | `agents/valkey-glide-review/src/tools/build.ts` | `cargo`, `gradle` (`./gradlew`), `go`, `npm` and `npx`, each with allowed actions and blocked tokens (`checkBuildArgs` in `build-policy.ts`): no publish, install or login, exact Gradle task names only, `go mod` limited to `graph`, `verify` and `why`, no `npm run` script that rewrites sources or deletes lock files, and no `npx` option that writes files. Working directory inside the checkout. 8 minutes, 1 MB (see below). |
-| `build` (valkey-review-bot) | `agents/valkey-review-bot-review/src/tools/build.ts` | `npm run` of `build`, `typecheck` or `test` and `npm test`, with no npm options; `npx tsc --noEmit`; `npx cdk synth -c config=<file>` in `infra` only; `node --test` on test files (`checkBuildArgs` in `build-policy.ts`). npx runs with `--offline --no`, so it never installs a package. No install, publish, deploy or login. Working directory: a package directory inside the checkout. The image installs every package's dependencies from main at image build time. 8 minutes, 1 MB (see below). |
 | `build` (valkey-admin) | `agents/valkey-admin-review/src/tools/build.ts` | `tsc --noEmit -p <tsconfig>`, `vitest run`, `tsx --test` on unit test files under `src/__tests__/`, `eslint` without `--fix`, `vite build`, and the fixed `tsup` build of `common`, each only in the package directories `checkBuildArgs` (`build-policy.ts`) lists for it, with allowlisted options and no path into a dot directory. Each tool's script starts from the root `node_modules` under the runtime's node, never through npm, so no package script and no lifecycle script runs; the tools still load the checkout's own config and test files. It refuses to run when the checkout tracks files under a `node_modules` or a package directory is a symbolic link. `common/dist` is rebuilt from the checkout before each command that imports it. No install, publish, package, deploy, server or Electron. The image installs main's dependencies with `npm ci --ignore-scripts`. 8 minutes, 1 MB (see below). |
 
 Paths under `tools/` are in `agents/common/src/tools/`. The tool tables in
@@ -630,7 +633,9 @@ Every reviewer prompt follows the same workflow headings:
 
 The GLIDE prompt adds a "Grep hazards" section and two worked examples, and
 the valkey-review-bot and valkey-admin prompts a "Repository hazards" section
-and two worked examples each.
+and two worked examples each. The valkey-review-bot reviewer runs no code, so
+its Phase 4 settles a claim by reading the callers, the tests and the stack
+code instead of running them.
 
 ### Terminal tools
 
@@ -766,12 +771,9 @@ model-facing `git` tool runs with no credentials at all.
 `buildChildEnv` (`agents/common/src/tools/child-env.ts`) gives `make` and
 `build` the runtime's environment minus every variable whose name starts with
 `AWS_`, `AMAZON_`, `GH_` or `GITHUB_`, or contains `TOKEN`, `SECRET`,
-`PASSWORD`, `CREDENTIAL` or `PRIVATE_KEY`. The valkey-review-bot reviewer's
-`build` adds `OFFLINE_ENV` (`build-policy.ts`): the AWS config and
-credentials files point at `/dev/null`, instance metadata is off, and npm
-runs offline, so `cdk synth` and tests find no credentials and download
-nothing. The valkey-admin reviewer's `build` adds its own `OFFLINE_ENV`:
-the same AWS settings, `METADATA_SERVER_DETECTION=none` for
+`PASSWORD`, `CREDENTIAL` or `PRIVATE_KEY`. The valkey-admin reviewer's
+`build` adds its own `OFFLINE_ENV`: the AWS config and credentials files
+point at `/dev/null`, instance metadata is off, `METADATA_SERVER_DETECTION=none` for
 google-auth-library, `CI=true`, and npm offline with scripts off in case
 code under test starts npm. `resolveInside` requires the
 working directory to resolve inside the checkout. Commands run from an

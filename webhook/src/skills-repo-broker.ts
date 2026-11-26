@@ -20,8 +20,9 @@ import { createAppSecretSource, fetchRepoInstallation, githubApi, type GitHubApi
  * Env:    SKILLS_REPO ("owner/name"), SKILLS_REPO_APP_SECRET_NAME (a
  *         Secrets Manager secret of the same JSON shape as the main App
  *         secret: app_id and private_key), MAIN_APP_ID (the main App id)
- *         and SKILLS_REPO_BOT_REVIEWED ("true" when a route reviews the
- *         bot repository, so the same app_id is refused)
+ *         and SKILLS_REPO_BOT_REVIEWED ("true" when a reviewer that runs
+ *         pull request code reviews the bot repository, so the same
+ *         app_id is refused)
  * Input:  { purpose?: string }
  * Output: { token, expires_at } or { error }
  */
@@ -112,8 +113,9 @@ export function skillsRepoBrokerFromEnv(
   const createAuth = opts.createAuth ?? createAppAuth;
   const secrets = createAppSecretSource(secretString);
   // Synthesis compares secret names only, so two secrets holding the same
-  // App pass it. Refuse at runtime when the bot repository is reviewed
-  // and both secrets belong to the same App id.
+  // App pass it. Refuse at runtime when a reviewer that runs pull request
+  // code reviews the bot repository and both secrets belong to the same
+  // App id.
   const mainAppId = env.MAIN_APP_ID?.trim();
   const botRepoReviewed = (env.SKILLS_REPO_BOT_REVIEWED ?? '').trim().toLowerCase() === 'true';
   if (botRepoReviewed && !mainAppId) throw new Error('MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true');
