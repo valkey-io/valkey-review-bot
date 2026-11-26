@@ -2,21 +2,26 @@
 #
 # valkey-review-bot is TypeScript on Node.js: agents, Lambda functions and
 # a CDK app, one npm package per component. The image carries Node.js,
-# git and gh, a clone of valkey-io/valkey-review-bot with every package's
-# dependencies installed, and the compiled agent.
+# git, gh and ripgrep, a clone of valkey-io/valkey-review-bot, and the
+# compiled agent.
+#
+# This reviewer runs no code from the pull requests it reviews: it has no
+# build or test tool, so the clone gets no dependencies and the image has
+# no toolchain beyond the Node.js the agent itself runs on. Keep it that
+# way: infra/lib/deployment-config.ts lets one GitHub App serve the bot
+# repository only because of it (REVIEWER_RUNS_PULL_REQUEST_CODE).
 #
 # Stages:
 #   base     Debian bookworm with Node.js.
 #   build    Compiles the agent's TypeScript (agents/common and
 #            agents/valkey-review-bot-review) and drops dev dependencies.
-#   runtime  base plus git, gh, the clone with its dependencies, and the
-#            build output.
+#   runtime  base plus git, gh, ripgrep, the clone, and the build output.
 #
 # Build with the repository root as the context: the agent imports
 # agents/common.
 #
-# Pinned: the base image by digest, and the clone's dependencies by each
-# package's package-lock.json. Not pinned: Node.js comes from the
+# Pinned: the base image by digest, and the agent's dependencies by its
+# package-lock.json. Not pinned: Node.js comes from the
 # NodeSource apt repository for NODE_MAJOR, and gh and the Debian
 # packages from their apt repositories at build time.
 
@@ -62,7 +67,6 @@ RUN npx tsc -p tsconfig.json \
 
 FROM base AS runtime
 
-# git and jq serve the scripts package's tests, bash comes with Debian.
 RUN mkdir -p -m 0755 /etc/apt/keyrings \
  && curl -fsSL -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
       https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -72,7 +76,7 @@ RUN mkdir -p -m 0755 /etc/apt/keyrings \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
       git gh \
-      ripgrep jq \
+      ripgrep \
  && rm -rf /var/lib/apt/lists/*
 
 # The agent runs as an unprivileged user that owns the clone, so git
@@ -88,29 +92,11 @@ USER agent
 # so blame and log -S run locally.
 RUN git clone --filter=blob:limit=1m https://github.com/valkey-io/valkey-review-bot.git /workspace/valkey-review-bot
 
-# The build tool installs nothing at review time, so every package with a
-# lockfile is installed here, as CI installs it: npm ci in each, dev
-# dependencies included. node_modules/ is gitignored, so it survives the
-# `git clean -fd` and checkout of each run. A pull request is therefore
-# type-checked and tested against main's dependencies as of this build,
-# not against its own package-lock.json.
-RUN cd /workspace/valkey-review-bot \
- && git ls-files -z -- '*package-lock.json' \
-      | xargs -0 -n1 dirname \
-      | while read -r pkg; do \
-          echo "npm ci in ${pkg}"; \
-          (cd "${pkg}" && npm ci --no-audit --no-fund) || exit 1; \
-        done \
- && npm cache clean --force
-
 WORKDIR /app/agents/valkey-review-bot-review
 COPY --from=build /app/agents/valkey-review-bot-review/package.json ./
 COPY --from=build /app/agents/valkey-review-bot-review/node_modules/ ./node_modules/
 COPY --from=build /app/agents/valkey-review-bot-review/dist/ ./dist/
 
-# NODE_ENV stays unset. Under NODE_ENV=production, npm ci would have
-# skipped the dev dependencies (typescript, jest, aws-cdk) that the
-# packages' typecheck, test and synth need.
 ENV WORKSPACE_ROOT=/workspace/valkey-review-bot
 
 CMD ["node", "--enable-source-maps", "/app/agents/valkey-review-bot-review/dist/valkey-review-bot-review/src/agent.js"]

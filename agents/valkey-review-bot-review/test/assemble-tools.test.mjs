@@ -29,7 +29,7 @@ test('assembleTools wires the terminal callback into the common tools', async ()
   assert.equal(isTerminalCallbackWired(onTerminal), true);
 });
 
-/** Every tool the agent can get: writes allowed and the build tool on. */
+/** Every tool the agent can get: writes allowed, and ALLOW_BUILD on to show it adds nothing. */
 async function fullToolNames() {
   const { assembleTools } = await import('../src/tools/index.ts');
   const prev = process.env.ALLOW_BUILD;
@@ -51,9 +51,12 @@ async function fullToolNames() {
 }
 
 // The image has no clangd, the only server the common lsp tool starts.
-test('the valkey-review-bot tool set has no lsp, shell or batch tool', async () => {
+// No tool runs code from the pull request: no build, test or shell tool,
+// even with ALLOW_BUILD set. infra relies on this to let one App serve
+// the bot repository (REVIEWER_RUNS_PULL_REQUEST_CODE).
+test('the valkey-review-bot tool set has no lsp, shell, batch or build tool', async () => {
   assert.deepEqual((await fullToolNames()).sort(), [
-    'build', 'edit', 'gh_api_read', 'git', 'glob', 'grep', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
+    'edit', 'gh_api_read', 'git', 'glob', 'grep', 'multi_edit', 'post_review', 'read', 'skip_review', 'write',
   ]);
 });
 
@@ -68,7 +71,7 @@ test('the prompt names exactly the tools the agent has', async () => {
     .flatMap((l) => [...l.split('|')[1].matchAll(/`([^`]+)`/g)].map((m) => m[1]));
   assert.ok(tabled.length > 0);
   for (const name of tabled) assert.ok(names.includes(name), `the prompt lists ${name}, which the agent does not have`);
-  for (const absent of ['lsp', 'bash', 'batch', 'post_issue_comment']) {
+  for (const absent of ['lsp', 'bash', 'batch', 'build', 'post_issue_comment']) {
     assert.ok(!prompt.includes(`\`${absent}\``), `the prompt does not offer ${absent}`);
   }
 });

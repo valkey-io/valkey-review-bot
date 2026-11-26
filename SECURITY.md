@@ -7,8 +7,9 @@ If you would like to be added to our list of vendors, please reach out to the Va
 
 ## What a deployment holds
 
-The reviewer checks out and builds code from the pull requests it reviews, so the
-review runtime is treated as running untrusted code. The design keeps credentials
+A reviewer checks out and builds code from the pull requests it reviews, so the
+review runtime is treated as running untrusted code. The one exception is
+`valkey-review-bot-review`, which only reads code and diffs. The design keeps credentials
 away from it:
 
 - The GitHub App private key and webhook secret are stored in AWS Secrets
@@ -37,10 +38,10 @@ away from it:
   branch and require reviews on it. The curator runs no code from a pull
   request or from upstream, has no shell, and its model never sees the token.
   Use a small App of its own for this, installed only on the bot repository.
-- A deployment can also review pull requests to the bot repository. Code in
-  those pull requests then gets that reviewer's `pull_requests: write` tokens
-  for the bot repository, like code in pull requests to any routed
-  repository. With them it can post reviews and comments as the bot, and
+- A deployment can also review pull requests to the bot repository. A
+  reviewer that builds and tests them hands their code that reviewer's
+  `pull_requests: write` tokens for the bot repository, like code in pull
+  requests to any routed repository. With them it can post reviews and comments as the bot, and
   edit or close pull requests there, the curator's skill pull requests
   included. Closing a skill-check pull request without merging counts as
   declining it: `closedUnmerged()` in `agents/curator/src/repo-skill-pr.ts`
@@ -48,10 +49,15 @@ away from it:
   release. So pull request code can quietly suppress a release's skill
   corrections, not just tidy up pull requests. The configuration refuses
   such a route unless `skillsRepo` has an App of its own, so the App the
-  reviewers use never holds Contents on that repository. It also refuses an
-  automatic review there: the route needs `mentionOnly` or an
-  `authorAllowlist`. Keep required reviews from maintainers on its base
-  branch.
+  reviewers use never holds Contents on that repository. The exception is
+  `valkey-review-bot-review`, the bot repository's own reviewer. It runs no
+  code from a pull request: it has no build, test or shell tool and only
+  reads code and diffs. With it as the route's reviewer, the main App may
+  serve `skillsRepo` too (`REVIEWER_RUNS_PULL_REQUEST_CODE` in
+  `infra/lib/deployment-config.ts`). The configuration also refuses an
+  automatic review there, whatever the reviewer: the route needs
+  `mentionOnly` or an `authorAllowlist`. Keep required reviews from
+  maintainers on its base branch.
   The receiver and the reviewer brokers ask for explicit permissions without
   `contents`, so with the reviewer App here none of their tokens carries it.
   But every account the reviewer App is installed on would have to grant it
@@ -98,7 +104,7 @@ away from it:
   repository holds only this app's images.
 - The reviewer has no shell tool. It works through file tools and argument-list
   wrappers for `git`, the GitHub REST API (GET only, limited to the repository
-  under review and its upstream), and the project's build tool.
+  under review and its upstream), and the project's build tool, where it has one.
 - Feedback that can change the reviewer's instructions (curator skills) is only
   accepted from repository owners, members and collaborators. A correction
   through feedback can change a published skill only after it graduated past

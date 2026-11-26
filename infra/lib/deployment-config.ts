@@ -13,6 +13,27 @@ import { RegionInfo } from 'aws-cdk-lib/region-info';
 export const REVIEWER_IDS = ['valkey-review', 'valkey-glide-review', 'valkey-review-bot-review', 'valkey-admin-review'] as const;
 export type ReviewerId = (typeof REVIEWER_IDS)[number];
 
+/**
+ * Whether a reviewer runs code from the pull requests it reviews: a build
+ * or test tool that starts the checkout's scripts, tests or compiler
+ * plugins. That code shares the agent's container, so it can read the
+ * agent process, reach the runtime's credentials and use the network; an
+ * environment scrub does not stop it. A reviewer marked false has no such
+ * tool, whatever agents.<id>.allowBuild says, and its image installs no
+ * toolchain for one. Its tool test (test/assemble-tools.test.mjs) pins
+ * that, and infra/test/deployment-config.test.ts checks its tools/index.ts
+ * offers no build tool.
+ *
+ * Only a reviewer marked false may review skillsRepo.repo while the
+ * skills-repo App is the main App (parseDeploymentConfig).
+ */
+export const REVIEWER_RUNS_PULL_REQUEST_CODE: Readonly<Record<ReviewerId, boolean>> = {
+  'valkey-review': true,
+  'valkey-glide-review': true,
+  'valkey-review-bot-review': false,
+  'valkey-admin-review': true,
+};
+
 /** Effort levels both providers accept (Bedrock Converse output_config and Mantle reasoning). */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type Effort = (typeof EFFORTS)[number];
@@ -443,23 +464,28 @@ export function parseDeploymentConfig(raw: unknown, env: { readonly CDK_DEFAULT_
   if (skillLifecycle.openPullRequests && skillsRepo === undefined) {
     r.fail('skillLifecycle.openPullRequests', 'is true but skillsRepo is not set, so there is no repository to open pull requests against');
   }
-  // A review route on the bot repository lets pull request code there get
-  // reviewer tokens for it. With the main App as the skills App, that App
-  // also holds Contents write on the repository.
-  if (skillsRepo && skillsRepo.appSecretName === github.appSecretName
-    && routes.some((route) => route.repo.toLowerCase() === skillsRepo.repo.toLowerCase())) {
-    r.fail('skillsRepo.appSecretName', `is the main App's secret, but routes review ${skillsRepo.repo}. Give skillsRepo an App of its own (infra/README.md, "The skills-repo App")`);
-  }
-  // Even with a separate skills App, an automatic review still runs pull
-  // request code with reviewer tokens for the bot repository. Those tokens
-  // can post reviews and close the curator's skill pull requests. Require
-  // an explicit trigger there: a mention or an author allowlist.
-  // curatorOnlyRoutes run no pull request code, so they are exempt here.
+  // With the main App as the skills App, that App holds Contents write on
+  // the bot repository, and the receiver and the reviewer brokers can read
+  // its key. A reviewer that runs pull request code there would hand that
+  // code the runtime and its reach. Allow such a route only for reviewers
+  // that run no pull request code (REVIEWER_RUNS_PULL_REQUEST_CODE).
   if (skillsRepo) {
+    const onBotRepo = (route: RouteConfig) => route.repo.toLowerCase() === skillsRepo.repo.toLowerCase();
+    if (skillsRepo.appSecretName === github.appSecretName) {
+      routes.forEach((route, i) => {
+        if (onBotRepo(route) && REVIEWER_RUNS_PULL_REQUEST_CODE[route.reviewer] !== false) {
+          r.fail(`routes[${i}].reviewer`, `is ${route.reviewer}, which runs pull request code, and it reviews ${skillsRepo.repo} while skillsRepo uses the main App's secret. Route a reviewer that runs no pull request code there, or give skillsRepo an App of its own (infra/README.md, "The skills-repo App")`);
+        }
+      });
+    }
+    // Reviewer tokens for the bot repository can post reviews and close
+    // the curator's skill pull requests, and a pull request's text reaches
+    // the reviewer's model. Require an explicit trigger there: a mention or
+    // an author allowlist. curatorOnlyRoutes start no review, so they are
+    // exempt here.
     routes.forEach((route, i) => {
-      if (route.repo.toLowerCase() === skillsRepo.repo.toLowerCase()
-        && !route.mentionOnly && route.authorAllowlist.length === 0) {
-        r.fail(`routes[${i}].mentionOnly`, `reviews ${skillsRepo.repo} automatically, so pull request code there runs with reviewer tokens. Set mentionOnly or authorAllowlist for this route (infra/README.md, "The skills-repo App")`);
+      if (onBotRepo(route) && !route.mentionOnly && route.authorAllowlist.length === 0) {
+        r.fail(`routes[${i}].mentionOnly`, `reviews ${skillsRepo.repo} automatically, so any pull request there starts a run with reviewer tokens for it. Set mentionOnly or authorAllowlist for this route (infra/README.md, "The skills-repo App")`);
       }
     });
   }

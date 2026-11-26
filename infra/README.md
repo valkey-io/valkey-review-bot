@@ -311,7 +311,7 @@ models.
 | --- | --- | --- |
 | `valkey-review.maxIterations`, `valkey-glide-review.maxIterations`, `valkey-review-bot-review.maxIterations`, `valkey-admin-review.maxIterations` | `150` | Maximum model calls per review, retries included (1 to 500). |
 | `valkey-review.maxTokens`, `valkey-glide-review.maxTokens`, `valkey-review-bot-review.maxTokens`, `valkey-admin-review.maxTokens` | `32768` | Output token limit per model call (1024 to 200000). |
-| `valkey-review.allowBuild`, `valkey-glide-review.allowBuild`, `valkey-review-bot-review.allowBuild`, `valkey-admin-review.allowBuild` | `true` | Lets the reviewer run the repository's build and tests. |
+| `valkey-review.allowBuild`, `valkey-glide-review.allowBuild`, `valkey-review-bot-review.allowBuild`, `valkey-admin-review.allowBuild` | `true` | Lets the reviewer run the repository's build and tests. `valkey-review-bot-review` has no build tool and never runs pull request code, so its runtime gets `ALLOW_BUILD=false` whatever this says. |
 | `valkey-review.allowWrite`, `valkey-glide-review.allowWrite`, `valkey-review-bot-review.allowWrite`, `valkey-admin-review.allowWrite` | `true` | Lets the reviewer write files in its checkout, for example a test that checks a claim. |
 | `curator.maxIterations` | `40` | Maximum tool rounds per feedback event (1 to 500). |
 | `curator.maxTokens` | `16384` | Output token limit per model call (1024 to 200000). |
@@ -376,7 +376,7 @@ the files from it without credentials, so it must be public.
 | --- | --- | --- |
 | `repo` | required | `owner/name` of the bot repository, for example `valkey-io/valkey-review-bot`. Passed to the curator and the broker as `SKILLS_REPO`. |
 | `baseBranch` | `main` | The branch the files are read from and pull requests target: at most 100 characters, a name git accepts. `SKILLS_REPO_BASE_BRANCH`. |
-| `appSecretName` | `github.appSecretName` | Secrets Manager secret of the App that opens the pull requests, with `app_id` and `private_key` (the same JSON shape as the main App secret; `webhook_secret` is not needed). See [The skills-repo App](#the-skills-repo-app). Required to differ from it when a route reviews `repo`. Passed to the broker as `SKILLS_REPO_APP_SECRET_NAME`. |
+| `appSecretName` | `github.appSecretName` | Secrets Manager secret of the App that opens the pull requests, with `app_id` and `private_key` (the same JSON shape as the main App secret; `webhook_secret` is not needed). See [The skills-repo App](#the-skills-repo-app). Required to differ from it when a route reviews `repo` with a reviewer that runs pull request code (every reviewer except `valkey-review-bot-review`). Passed to the broker as `SKILLS_REPO_APP_SECRET_NAME`. |
 | `signOff` | the App's bot identity | `Name <email>` on one line for the commit's `Signed-off-by` line. The name is 1 to 100 characters, with no control characters, no `<` or `>`, and no space or other whitespace at either end. `SKILLS_REPO_SIGN_OFF`. |
 
 ### `dailyReviewBudget`
@@ -445,8 +445,10 @@ runtime, token broker and concerns table are still deployed. The repository
 has no GA release yet, so the decay job never queues a check of that
 reviewer's repo skill file, `agents/valkey-review-bot-review/config/skill.md`,
 not even with `recheck_all`. Check it by hand with `scripts/skill-facts.mjs`.
-A route that reviews the bot repository also needs `skillsRepo` to use an App
-of its own ([The skills-repo App](#the-skills-repo-app)).
+A route that reviews the bot repository needs `mentionOnly` or an
+`authorAllowlist`. With `valkey-review-bot-review` as its reviewer, the main
+App may serve `skillsRepo` too. Any other reviewer there needs a skills-repo
+App of its own ([The skills-repo App](#the-skills-repo-app)).
 
 The `valkey-admin-review` reviewer, for pull requests to
 [Valkey Admin](https://github.com/valkey-io/valkey-admin), is new too, with
@@ -677,14 +679,32 @@ write), and each account it is installed on, such as `valkey-io` for
 `valkey-io/valkey`, must approve that new permission. Its private key,
 which the receiver and the reviewer brokers can read, could then mint
 `contents: write` tokens for every repository the App is installed on.
-A deployment with a route that reviews the bot repository must use an App
-of its own here: the configuration refuses the main App's secret then, and
-refuses an automatic review there (the route needs `mentionOnly` or an
-`authorAllowlist`). The name check compares secret names only, so two
-secrets holding the same App's credentials would pass it. The skills-repo
-broker therefore compares the secrets' `app_id` values at runtime when the
-bot repository is reviewed, and refuses to issue a token when they match.
-Keep the two secrets on different Apps.
+A route that reviews the bot repository decides whether the main App may
+serve here:
+
+- With `valkey-review-bot-review` as the route's reviewer, the main App may
+  serve. That reviewer runs no code from a pull request: it has no build,
+  test or shell tool, and its image installs no dependencies for the
+  checkout. It only reads code and diffs. So pull request code never runs
+  next to the runtime that can reach the main App's tokens.
+- With any other reviewer, the bot repository needs an App of its own here.
+  Those reviewers build and test the pull request. Scrubbing the
+  environment is not a sandbox: that code can read the agent process,
+  reach the runtime's credentials and use the network. The configuration
+  refuses the main App's secret for such a route.
+
+`REVIEWER_RUNS_PULL_REQUEST_CODE` in `lib/deployment-config.ts` records
+which reviewers run pull request code. A reviewer marked `false` must have
+no build tool; a test checks its `src/tools/index.ts`.
+
+Either way, the configuration refuses an automatic review on the bot
+repository: the route needs `mentionOnly` or an `authorAllowlist`.
+
+The name check compares secret names only, so two secrets holding the same
+App's credentials would pass it. The skills-repo broker therefore compares
+the secrets' `app_id` values at runtime when a reviewer that runs pull
+request code reviews the bot repository, and refuses to issue a token when
+they match. Keep the two secrets on different Apps in that case.
 
 The receiver and the reviewer brokers ask for explicit permissions without
 Contents either way: the receiver for `pull_requests: write`,
