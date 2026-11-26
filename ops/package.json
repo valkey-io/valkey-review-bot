@@ -11,9 +11,9 @@
     "test": "node --test --experimental-strip-types test/*.test.mjs"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1149.0",
-    "@aws-sdk/client-sqs": "^3.1149.0",
-    "@aws-sdk/lib-dynamodb": "^3.1149.0"
+    "@aws-sdk/client-dynamodb": "^3.1156.0",
+    "@aws-sdk/client-sqs": "^3.1156.0",
+    "@aws-sdk/lib-dynamodb": "^3.1156.0"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",

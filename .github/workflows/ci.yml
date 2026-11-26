@@ -59,9 +59,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: agent-sh/agnix@2c0e4efede3181599eca37619e8067ae2d941c00 # v0.57.0
+      - uses: agent-sh/agnix@36c6801f79a12fb1c639696d4095182a322362f2 # v0.59.3
         with:
-          version: 'v0.57.0'
+          version: 'v0.59.3'
 
   secret-scan:
     name: Secret scan (scrump)
