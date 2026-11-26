@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import * as cdk from 'aws-cdk-lib';
 import { Match } from 'aws-cdk-lib/assertions';
 import { bedrockModelArns, modelAccessStatements } from '../lib/bedrock-arns';
-import { parseDeploymentConfig } from '../lib/deployment-config';
+import { parseDeploymentConfig, REVIEWER_IDS, type ReviewerId } from '../lib/deployment-config';
 import { routeMaps } from '../lib/webhook-stack';
 import {
   ACCOUNT,
@@ -27,8 +27,8 @@ beforeAll(() => {
   s = synth();
 });
 
-const reviewerTemplate = (id: 'valkey-review' | 'valkey-glide-review') => s.template(s.stacks.reviewers.get(id)!);
-const reviewerStatements = (id: 'valkey-review' | 'valkey-glide-review'): Statement[] => {
+const reviewerTemplate = (id: ReviewerId) => s.template(s.stacks.reviewers.get(id)!);
+const reviewerStatements = (id: ReviewerId): Statement[] => {
   const t = reviewerTemplate(id);
   return statementsForRole(t, runtimeRoleId(t));
 };
@@ -83,7 +83,7 @@ describe('no deployment-specific literals', () => {
 });
 
 describe('reviewer role', () => {
-  test.each(['valkey-review', 'valkey-glide-review'] as const)('%s cannot read secrets, write registries or touch concerns', (id) => {
+  test.each(REVIEWER_IDS)('%s cannot read secrets, write registries or touch concerns', (id) => {
     const statements = reviewerStatements(id);
     expect(statements.length).toBeGreaterThan(0);
     const actions = statements.flatMap(actionsOf);
@@ -101,6 +101,8 @@ describe('reviewer role', () => {
     expect(resourceStrings(bySid(valkey, 'ReadSkillsRegistry')))
       .toEqual([registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`]);
     expect(JSON.stringify(valkey)).not.toContain('glideRegistry1');
+    expect(JSON.stringify(valkey)).not.toContain('reviewBotRegistry1');
+    expect(JSON.stringify(valkey)).not.toContain('adminRegistry1');
     const s3 = valkey.filter((st) => actionsOf(st).some((a) => a.startsWith('s3:')));
     expect(s3.map((st) => st.Sid)).toEqual(['ReadAgentAssets']);
     expect(actionsOf(s3[0]!)).toEqual(['s3:GetObject']);
@@ -111,6 +113,52 @@ describe('reviewer role', () => {
     const invoke = valkey.filter((st) => actionsOf(st).includes('lambda:InvokeFunction'));
     expect(JSON.stringify(invoke)).toContain('TokenBrokerValkeyReviewFn');
     expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyGlideReviewFn');
+    expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyReviewBotReviewFn');
+    expect(JSON.stringify(invoke)).not.toContain('TokenBrokerValkeyAdminReviewFn');
+  });
+
+  test('the valkey-review-bot reviewer gets its own registry, prefix, broker, workspace and upstream', () => {
+    const bot = reviewerStatements('valkey-review-bot-review');
+    expect(resourceStrings(bySid(bot, 'ReadSkillsRegistry')))
+      .toEqual([registryArn('reviewBotRegistry1'), `${registryArn('reviewBotRegistry1')}/record/*`]);
+    expect(JSON.stringify(bot)).not.toContain('valkeyRegistry1');
+    expect(JSON.stringify(bot)).not.toContain('glideRegistry1');
+    expect(JSON.stringify(bot)).not.toContain('adminRegistry1');
+    expect(JSON.stringify(bySid(bot, 'ReadAgentAssets')[0]!.Resource)).toContain('/valkey-review-bot-review/*');
+    const invoke = JSON.stringify(bot.filter((st) => actionsOf(st).includes('lambda:InvokeFunction')));
+    expect(invoke).toContain('TokenBrokerValkeyReviewBotReviewFn');
+    expect(invoke).not.toMatch(/TokenBrokerValkeyReviewFn[0-9A-F]{8}/);
+    expect(invoke).not.toContain('TokenBrokerValkeyGlideReviewFn');
+    expect(invoke).not.toContain('TokenBrokerValkeyAdminReviewFn');
+    expect(s.stacks.reviewers.get('valkey-review-bot-review')!.stackName).toBe('ValkeyReviewBotReviewAgent');
+    expect(runtimeEnv(reviewerTemplate('valkey-review-bot-review'))).toMatchObject({
+      SKILLS_REGISTRY_ID: 'reviewBotRegistry1',
+      WORKSPACE_ROOT: '/workspace/valkey-review-bot',
+      UPSTREAM_REPO: 'valkey-io/valkey-review-bot',
+      PROMPT_S3_KEY: 'valkey-review-bot-review/prompt.md',
+      SKILL_S3_KEY: 'valkey-review-bot-review/skill.md',
+    });
+  });
+
+  test('the valkey-admin reviewer gets its own registry, prefix, broker, workspace and upstream', () => {
+    const admin = reviewerStatements('valkey-admin-review');
+    expect(resourceStrings(bySid(admin, 'ReadSkillsRegistry')))
+      .toEqual([registryArn('adminRegistry1'), `${registryArn('adminRegistry1')}/record/*`]);
+    for (const other of ['valkeyRegistry1', 'glideRegistry1', 'reviewBotRegistry1']) expect(JSON.stringify(admin)).not.toContain(other);
+    expect(JSON.stringify(bySid(admin, 'ReadAgentAssets')[0]!.Resource)).toContain('/valkey-admin-review/*');
+    const invoke = JSON.stringify(admin.filter((st) => actionsOf(st).includes('lambda:InvokeFunction')));
+    expect(invoke).toContain('TokenBrokerValkeyAdminReviewFn');
+    expect(invoke).not.toMatch(/TokenBrokerValkeyReviewFn[0-9A-F]{8}/);
+    expect(invoke).not.toContain('TokenBrokerValkeyGlideReviewFn');
+    expect(invoke).not.toContain('TokenBrokerValkeyReviewBotReviewFn');
+    expect(s.stacks.reviewers.get('valkey-admin-review')!.stackName).toBe('ValkeyAdminReviewAgent');
+    expect(runtimeEnv(reviewerTemplate('valkey-admin-review'))).toMatchObject({
+      SKILLS_REGISTRY_ID: 'adminRegistry1',
+      WORKSPACE_ROOT: '/workspace/valkey-admin',
+      UPSTREAM_REPO: 'valkey-io/valkey-admin',
+      PROMPT_S3_KEY: 'valkey-admin-review/prompt.md',
+      SKILL_S3_KEY: 'valkey-admin-review/skill.md',
+    });
   });
 
   test('the curator writes only its own runtime log groups', () => {
@@ -118,7 +166,7 @@ describe('reviewer role', () => {
     expect(resourceStrings(bySid(curatorStatements(), 'RuntimeLogs'))).toEqual([group, `${group}:*`]);
   });
 
-  test.each(['valkey-review', 'valkey-glide-review'] as const)('%s sessions end two hours after they start at the latest', (id) => {
+  test.each(REVIEWER_IDS)('%s sessions end two hours after they start at the latest', (id) => {
     const runtime = Object.values<any>(reviewerTemplate(id).findResources('AWS::BedrockAgentCore::Runtime'))[0];
     expect(runtime.Properties.LifecycleConfiguration).toEqual({ IdleRuntimeSessionTimeout: 900, MaxLifetime: 7200 });
   });
@@ -126,6 +174,8 @@ describe('reviewer role', () => {
   test.each([
     ['valkey-review', 'valkey_review_runtime'],
     ['valkey-glide-review', 'valkey_glide_review_runtime'],
+    ['valkey-review-bot-review', 'valkey_review_bot_review_runtime'],
+    ['valkey-admin-review', 'valkey_admin_review_runtime'],
   ] as const)('%s writes only its own runtime log groups', (id, runtimeName) => {
     const group = `arn:aws:logs:us-west-2:${ACCOUNT}:log-group:/aws/bedrock-agentcore/runtimes/${runtimeName}-*`;
     expect(resourceStrings(bySid(reviewerStatements(id), 'RuntimeLogs'))).toEqual([group, `${group}:*`]);
@@ -176,18 +226,22 @@ describe('curator role', () => {
     const statements = curatorStatements();
     const writers = statements.filter((st) => actionsOf(st).some((a) => /^agent-registry:(Create|Update|Delete)/.test(a)));
     expect(resourceStrings(writers).sort()).toEqual([
+      registryArn('adminRegistry1'), `${registryArn('adminRegistry1')}/record/*`,
       registryArn('glideRegistry1'), `${registryArn('glideRegistry1')}/record/*`,
+      registryArn('reviewBotRegistry1'), `${registryArn('reviewBotRegistry1')}/record/*`,
       registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`,
     ]);
     const own = statements.filter((st) => JSON.stringify(st.Resource).includes('curatorRegistry1'));
     expect(own.flatMap(actionsOf).sort()).toEqual(['agent-registry:GetRegistryRecord', 'agent-registry:ListRegistryRecords']);
   });
 
-  test('reads and writes both concerns tables with their KMS key, and has no secrets', () => {
+  test('reads and writes every concerns table with their KMS key, and has no secrets', () => {
     const statements = curatorStatements();
     const concerns = bySid(statements, 'ConcernsReadWrite')[0]!;
     expect(JSON.stringify(concerns.Resource)).toContain('ValkeyReviewAgent');
     expect(JSON.stringify(concerns.Resource)).toContain('ValkeyGlideReviewAgent');
+    expect(JSON.stringify(concerns.Resource)).toContain('ValkeyReviewBotReviewAgent');
+    expect(JSON.stringify(concerns.Resource)).toContain('ValkeyAdminReviewAgent');
     expect(statements.some((st) => actionsOf(st).includes('kms:GenerateDataKey*')
       && JSON.stringify(st.Resource).includes('SubstrateKey'))).toBe(true);
     expect(statements.flatMap(actionsOf).filter((a) => a.startsWith('secretsmanager:'))).toEqual([]);
@@ -202,7 +256,7 @@ describe('curator role', () => {
   });
 
   test('each runtime uses the role defined in its own stack', () => {
-    for (const stack of [s.stacks.reviewers.get('valkey-review')!, s.stacks.reviewers.get('valkey-glide-review')!, s.stacks.curator]) {
+    for (const stack of [...REVIEWER_IDS.map((id) => s.stacks.reviewers.get(id)!), s.stacks.curator]) {
       const t = s.template(stack);
       const runtime = Object.values<any>(t.findResources('AWS::BedrockAgentCore::Runtime'))[0];
       expect(runtime.Properties.RoleArn).toEqual({ 'Fn::GetAtt': [runtimeRoleId(t), 'Arn'] });
@@ -216,6 +270,8 @@ describe('curator role', () => {
     expect(curatorOutputs).not.toHaveProperty('SkillsRegistryId');
     expect(reviewerTemplate('valkey-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('valkeyRegistry1');
     expect(reviewerTemplate('valkey-glide-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('glideRegistry1');
+    expect(reviewerTemplate('valkey-review-bot-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('reviewBotRegistry1');
+    expect(reviewerTemplate('valkey-admin-review').toJSON().Outputs.SkillsRegistryId.Value).toBe('adminRegistry1');
   });
 
   test('runtime environment carries the curator settings', () => {
@@ -227,7 +283,10 @@ describe('curator role', () => {
       MANTLE_REGION: 'us-east-1',
       GRADUATION_THRESHOLD: '4',
       CURATOR_SKILLS_REGISTRY_ID: 'curatorRegistry1',
-      SKILLS_REGISTRIES_JSON: JSON.stringify({ 'valkey-review': 'valkeyRegistry1', 'valkey-glide-review': 'glideRegistry1' }),
+      SKILLS_REGISTRIES_JSON: JSON.stringify({
+        'valkey-review': 'valkeyRegistry1', 'valkey-glide-review': 'glideRegistry1', 'valkey-review-bot-review': 'reviewBotRegistry1',
+        'valkey-admin-review': 'adminRegistry1',
+      }),
       PROMPT_S3_KEY: 'curator/prompt.md',
       SKILL_S3_KEY: 'curator/skill.md',
     });
@@ -236,7 +295,10 @@ describe('curator role', () => {
   test('skill maintenance runs in report mode by default, with no skills repository', () => {
     const env = runtimeEnv(s.template(s.stacks.curator));
     expect(env).toMatchObject({
-      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      UPSTREAM_REPOS_JSON: JSON.stringify({
+        'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot',
+        'valkey-admin-review': 'valkey-io/valkey-admin',
+      }),
       CHECK_PROMPT_S3_KEY: 'curator/skill-check.md',
       CHECK_MAX_ROUNDS: '25',
       CHECK_APPLY_EDITS: 'false',
@@ -270,7 +332,9 @@ describe('curator role', () => {
     const curatorRole = runtimeRoleId(s.template(s.stacks.curator));
     expect(holders.map(({ stack, roles }) => ({ stack, roles }))).toEqual([{ stack: s.stacks.curator.stackName, roles: [curatorRole] }]);
     expect(resourceStrings(holders.map(({ statement }) => statement)).sort()).toEqual([
+      registryArn('adminRegistry1'), `${registryArn('adminRegistry1')}/record/*`,
       registryArn('glideRegistry1'), `${registryArn('glideRegistry1')}/record/*`,
+      registryArn('reviewBotRegistry1'), `${registryArn('reviewBotRegistry1')}/record/*`,
       registryArn('valkeyRegistry1'), `${registryArn('valkeyRegistry1')}/record/*`,
     ]);
     for (const stack of s.allStacks.filter((st) => st !== s.stacks.curator)) {
@@ -314,10 +378,34 @@ describe('skills repository', () => {
     expect(ids).toHaveLength(1);
     const fn = (t.findResources('AWS::Lambda::Function')[ids[0]!] as any).Properties;
     expect(fn).toMatchObject({ Runtime: 'nodejs24.x', Architectures: ['arm64'], Timeout: 15, MemorySize: 256 });
-    expect(fn.Environment.Variables).toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/github-app' });
+    expect(fn.Environment.Variables).toEqual({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_APP_SECRET_NAME: 'example/github-app',
+      MAIN_APP_ID: '123456',
+      SKILLS_REPO_BOT_REVIEWED: 'false',
+    });
     expect(t.toJSON().Outputs.SkillsRepoTokenBrokerFunctionName.Value).toEqual({ Ref: ids[0] });
     expect(functionEnv(custom.template(custom.stacks.substrate), 'SkillsRepoTokenBrokerFn'))
-      .toEqual({ SKILLS_REPO: 'example-org/valkey-review-bot', SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app' });
+      .toEqual({
+        SKILLS_REPO: 'example-org/valkey-review-bot',
+        SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app',
+        MAIN_APP_ID: '123456',
+        SKILLS_REPO_BOT_REVIEWED: 'false',
+      });
+    const reviewed = synth({
+      ...fixture(),
+      skillsRepo: { repo: 'example-org/valkey-review-bot', appSecretName: 'example/skills-app' },
+      routes: [...fixture().routes, {
+        id: 'bot-review', reviewer: 'valkey-review-bot-review', repo: 'example-org/valkey-review-bot',
+        mentionOnly: true,
+      }],
+    });
+    expect(functionEnv(reviewed.template(reviewed.stacks.substrate), 'SkillsRepoTokenBrokerFn')).toEqual({
+      SKILLS_REPO: 'example-org/valkey-review-bot',
+      SKILLS_REPO_APP_SECRET_NAME: 'example/skills-app',
+      MAIN_APP_ID: '123456',
+      SKILLS_REPO_BOT_REVIEWED: 'true',
+    });
   });
 
   test('the broker may read its App secret and nothing else', () => {
@@ -349,9 +437,11 @@ describe('skills repository', () => {
         const permissions = Object.values<any>(x.template(stack).findResources('AWS::Lambda::Permission'));
         expect(permissions.filter((p) => JSON.stringify(p).includes('SkillsRepoTokenBroker'))).toEqual([]);
       }
-      // The reviewer runtimes keep invoke on their own brokers only, and
-      // their brokers do not cover the bot repository.
-      for (const id of ['valkey-review', 'valkey-glide-review'] as const) {
+      // The reviewer runtimes keep invoke on their own brokers only. The
+      // Valkey and GLIDE brokers never cover the bot repository; the bot
+      // reviewer's broker covers it only through a route, which config
+      // validation allows only with a skills App of its own.
+      for (const id of REVIEWER_IDS) {
         const t = x.template(x.stacks.reviewers.get(id)!);
         expect(JSON.stringify(statementsForRole(t, runtimeRoleId(t)))).not.toContain('SkillsRepoTokenBroker');
       }
@@ -384,7 +474,12 @@ describe('skills repository', () => {
 describe('token broker', () => {
   test("each broker's allowed repositories equal its reviewer's review routes", () => {
     const t = s.template(s.stacks.substrate);
-    for (const [reviewer, fn] of [['valkey-review', 'TokenBrokerValkeyReviewFn'], ['valkey-glide-review', 'TokenBrokerValkeyGlideReviewFn']] as const) {
+    for (const [reviewer, fn] of [
+      ['valkey-review', 'TokenBrokerValkeyReviewFn'],
+      ['valkey-glide-review', 'TokenBrokerValkeyGlideReviewFn'],
+      ['valkey-review-bot-review', 'TokenBrokerValkeyReviewBotReviewFn'],
+      ['valkey-admin-review', 'TokenBrokerValkeyAdminReviewFn'],
+    ] as const) {
       const env = functionEnv(t, fn);
       expect(env.ALLOWED_REPOS_JSON).toBe(JSON.stringify(s.config.routes.filter((r) => r.reviewer === reviewer).map((r) => r.repo)));
       expect(env.GITHUB_APP_ID).toBe('123456');
@@ -392,11 +487,11 @@ describe('token broker', () => {
   });
 
   test('is the only reader of the GitHub App secret outside the webhook receiver', () => {
-    for (const stack of [s.stacks.reviewers.get('valkey-review')!, s.stacks.reviewers.get('valkey-glide-review')!, s.stacks.curator, s.stacks.decay]) {
+    for (const stack of [...REVIEWER_IDS.map((id) => s.stacks.reviewers.get(id)!), s.stacks.curator, s.stacks.decay]) {
       expect(JSON.stringify(s.template(stack).toJSON())).not.toContain('secretsmanager:');
     }
     const t = s.template(s.stacks.substrate);
-    for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn']) {
+    for (const fn of ['TokenBrokerValkeyReviewFn', 'TokenBrokerValkeyGlideReviewFn', 'TokenBrokerValkeyReviewBotReviewFn', 'TokenBrokerValkeyAdminReviewFn']) {
       const broker = statementsForRole(t, functionRoleId(t, fn));
       expect(broker.flatMap(actionsOf)).toContain('secretsmanager:GetSecretValue');
       expect(JSON.stringify(broker)).toContain(':secret:example/github-app-??????');
@@ -524,7 +619,7 @@ describe('webhook', () => {
     const queueId = Object.keys(s.template(s.stacks.webhook).findResources('AWS::SQS::Queue')).find((id) => id.startsWith('CuratorQueue'))!;
     expect(s.template(s.stacks.webhook).toJSON().Outputs.CuratorQueueUrl.Value).toEqual({ Ref: queueId });
     expect(s.stacks.webhook.curatorQueue.node.id).toBe('CuratorQueue');
-    for (const id of ['valkey-review', 'valkey-glide-review'] as const) {
+    for (const id of REVIEWER_IDS) {
       expect(reviewerTemplate(id).toJSON().Outputs).toHaveProperty('ConcernsTableName');
     }
     // The manual decay pass is invoked by function name.
@@ -589,7 +684,9 @@ describe('decay', () => {
       DECAY_FLOOR: '0.1',
       DECAY_GRADUATED_HALF_LIFE_SECONDS: String(365 * 86400),
       // A reviewer whose upstream is empty gets no checks.
-      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      UPSTREAM_REPOS_JSON: JSON.stringify({
+        'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot', 'valkey-admin-review': 'valkey-io/valkey-admin',
+      }),
       SKILL_CHECKS_PER_DAY: '0',
       SKILL_RECHECK_SECONDS: String(30 * 86400),
       RETIRE_SKILLS: 'true',
@@ -598,7 +695,9 @@ describe('decay', () => {
     });
     // The curator runs what the decay job queues, under the same switch.
     expect(runtimeEnv(custom.template(custom.stacks.curator))).toMatchObject({
-      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      UPSTREAM_REPOS_JSON: JSON.stringify({
+        'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot', 'valkey-admin-review': 'valkey-io/valkey-admin',
+      }),
       RETIRE_SKILLS: 'true',
       CHECK_APPLY_EDITS: 'true',
       CHECK_OPEN_PULL_REQUESTS: 'true',
@@ -616,7 +715,10 @@ describe('decay', () => {
     expect(env).toMatchObject({
       DECAY_HALF_LIFE_SECONDS: String(30 * 86400),
       DECAY_GRADUATED_HALF_LIFE_SECONDS: '15552000',
-      UPSTREAM_REPOS_JSON: JSON.stringify({ 'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide' }),
+      UPSTREAM_REPOS_JSON: JSON.stringify({
+        'valkey-review': 'valkey-io/valkey', 'valkey-glide-review': 'valkey-io/valkey-glide', 'valkey-review-bot-review': 'valkey-io/valkey-review-bot',
+        'valkey-admin-review': 'valkey-io/valkey-admin',
+      }),
       SKILL_CHECKS_PER_DAY: '10',
       SKILL_RECHECK_SECONDS: '7776000',
       RETIRE_SKILLS: 'false',

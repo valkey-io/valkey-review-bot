@@ -20,6 +20,20 @@
 !agents/valkey-glide-review/src
 !agents/valkey-glide-review/src/**
 
+!agents/valkey-review-bot-review/Dockerfile
+!agents/valkey-review-bot-review/package.json
+!agents/valkey-review-bot-review/package-lock.json
+!agents/valkey-review-bot-review/tsconfig.json
+!agents/valkey-review-bot-review/src
+!agents/valkey-review-bot-review/src/**
+
+!agents/valkey-admin-review/Dockerfile
+!agents/valkey-admin-review/package.json
+!agents/valkey-admin-review/package-lock.json
+!agents/valkey-admin-review/tsconfig.json
+!agents/valkey-admin-review/src
+!agents/valkey-admin-review/src/**
+
 !agents/curator/Dockerfile
 !agents/curator/package.json
 !agents/curator/package-lock.json

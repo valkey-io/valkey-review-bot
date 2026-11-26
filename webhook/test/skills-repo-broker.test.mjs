@@ -161,6 +161,44 @@ test('skillsRepoBrokerFromEnv needs SKILLS_REPO and a secret with app_id and pri
   assert.deepEqual(auth.created, []);
 });
 
+test('refuses the main App id when the bot repository is reviewed', async () => {
+  const secret = JSON.stringify({ app_id: 4242, private_key: '-----BEGIN KEY-----' });
+  const refused = skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, MAIN_APP_ID: '4242', SKILLS_REPO_BOT_REVIEWED: 'true' },
+    async () => secret, { createAuth: fakeAuth().createAuth },
+  );
+  assert.deepEqual(await refused({}), { error: 'the skills-repo App must differ from the main App when the bot repository is reviewed' });
+
+  const allowed = skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, MAIN_APP_ID: '9999', SKILLS_REPO_BOT_REVIEWED: 'true' },
+    async () => secret,
+    {
+      createAuth: fakeAuth().createAuth,
+      fetch: fakeFetch({ [`https://api.github.com/repos/${REPO}/installation`]: installed() }).fetch,
+    },
+  );
+  assert.equal((await allowed({})).token, TOKEN);
+
+  const unreviewed = skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, MAIN_APP_ID: '4242', SKILLS_REPO_BOT_REVIEWED: 'false' },
+    async () => secret,
+    {
+      createAuth: fakeAuth().createAuth,
+      fetch: fakeFetch({ [`https://api.github.com/repos/${REPO}/installation`]: installed() }).fetch,
+    },
+  );
+  assert.equal((await unreviewed({})).token, TOKEN);
+
+  assert.throws(() => skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, SKILLS_REPO_BOT_REVIEWED: 'true' },
+    async () => secret, { createAuth: fakeAuth().createAuth },
+  ), /MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true/);
+  assert.throws(() => skillsRepoBrokerFromEnv(
+    { SKILLS_REPO: REPO, MAIN_APP_ID: '   ', SKILLS_REPO_BOT_REVIEWED: ' True ' },
+    async () => secret, { createAuth: fakeAuth().createAuth },
+  ), /MAIN_APP_ID is required when SKILLS_REPO_BOT_REVIEWED is true/);
+});
+
 test('the handler needs SKILLS_REPO_APP_SECRET_NAME', async () => {
   const saved = process.env.SKILLS_REPO_APP_SECRET_NAME;
   delete process.env.SKILLS_REPO_APP_SECRET_NAME;

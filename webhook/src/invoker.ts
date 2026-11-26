@@ -263,6 +263,10 @@ async function handleOne(record: SqsRecord): Promise<void> {
   const payload = decision.useFallbackModel ? { ...envelope, use_fallback_model: true } : envelope;
   console.log(`[invoke] ${tag} attempt=${receiveCount}${decision.useFallbackModel ? ` fallback_model=true (${decision.reason})` : ''}`);
 
+  // No runtimeSessionId: every run gets a new AgentCore session, so a new
+  // container from the image. The valkey-admin image relies on this
+  // (agents/valkey-admin-review/Dockerfile): code under test can change its
+  // node_modules, which must not carry into the next review.
   const resp = await client.send(new InvokeAgentRuntimeCommand({
     agentRuntimeArn: config.runtimeArn,
     contentType: 'application/json',
